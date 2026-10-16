@@ -1,0 +1,23 @@
+# Build
+build/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+
+# vcpkg
+vcpkg_installed/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Binaries
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.dll
