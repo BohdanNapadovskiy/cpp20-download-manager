@@ -1,6 +1,13 @@
 #pragma once
 
-
 namespace dm::core {
-    const char* get_curl_version();
+    class CurlGlobal {
+    public:
+        CurlGlobal();
+        CurlGlobal(const CurlGlobal &) = delete;
+        CurlGlobal &operator=(const CurlGlobal &) = delete;
+        ~CurlGlobal();
+    };
+
+    const char *get_curl_version();
 }
