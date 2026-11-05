@@ -35,7 +35,7 @@ FetchContent_Declare(
         curl
         URL https://curl.se/download/curl-8.23.0.zip
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-        #        URL_HASH SHA256=
+        URL_HASH SHA256=85477fe11408471285f38a601e7c6f53470d13be9a5a316919b071ad02e68213
 )
 
 set(CURL_USE_SCHANNEL ON CACHE BOOL "" FORCE)
