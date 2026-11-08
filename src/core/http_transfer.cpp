@@ -20,7 +20,7 @@ namespace dm::core {
 
         struct FileWriteState {
             std::filesystem::path part_path;
-            std::ofstream stream;
+            std::ofstream stream{};
             std::uintmax_t bytes_transferred = 0;
             WriteFailure failure = WriteFailure::None;
         };
@@ -86,7 +86,7 @@ namespace dm::core {
         EasyHandle handle = create_easy_handle();
         char error_buffer[CURL_ERROR_SIZE];
         error_buffer[0] = '\0';
-        FileWriteState state = FileWriteState{.part_path = request.part_path};
+        FileWriteState state{.part_path = request.part_path};
         curl_easy_setopt(handle.get(), CURLOPT_URL, request.url.c_str());
         curl_easy_setopt(handle.get(), CURLOPT_ERRORBUFFER, error_buffer);
         curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, write_callback);
