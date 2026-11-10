@@ -119,6 +119,7 @@ namespace dm::core {
         char error_buffer[CURL_ERROR_SIZE];
         error_buffer[0] = '\0';
         long response_code = 0;
+        const long second  = static_cast<long>(request.connect_timeout.count());
         FileWriteState state{.part_path = request.part_path};
         curl_easy_setopt(handle.get(), CURLOPT_URL, request.url.c_str());
         curl_easy_setopt(handle.get(), CURLOPT_ERRORBUFFER, error_buffer);
@@ -129,6 +130,7 @@ namespace dm::core {
         curl_easy_setopt(handle.get(), CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(handle.get(), CURLOPT_MAXREDIRS, 10L);
         curl_easy_setopt(handle.get(), CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+        curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT, second);
         const CURLcode code = curl_easy_perform(handle.get());
         auto info_code = curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response_code);
         if (info_code != CURLE_OK) {
