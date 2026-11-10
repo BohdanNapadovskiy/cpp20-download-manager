@@ -118,6 +118,7 @@ namespace dm::core {
         EasyHandle handle = create_easy_handle();
         char error_buffer[CURL_ERROR_SIZE];
         error_buffer[0] = '\0';
+        long response_code = 0;
         FileWriteState state{.part_path = request.part_path};
         curl_easy_setopt(handle.get(), CURLOPT_URL, request.url.c_str());
         curl_easy_setopt(handle.get(), CURLOPT_ERRORBUFFER, error_buffer);
@@ -126,34 +127,37 @@ namespace dm::core {
         curl_easy_setopt(handle.get(), CURLOPT_HEADERFUNCTION, header_callback);
         curl_easy_setopt(handle.get(), CURLOPT_HEADERDATA, &state);
         const CURLcode code = curl_easy_perform(handle.get());
+        auto info_code = curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response_code);
+        if (info_code != CURLE_OK) {
+            response_code = 0;
+        }
+        const int http_status = static_cast<int>(response_code);
         if (state.stream.is_open()) {
             state.stream.close();
             if (state.stream.fail() && state.failure == WriteFailure::None) {
                 state.failure = WriteFailure::Close;
             }
         }
+        TransferError error = TransferError::None;
+        std::string error_msg;
         if (state.failure != WriteFailure::None) {
-            return TransferResult{
-                .error = TransferError::DiskWrite,
-                .error_message = describe(state.failure, state.part_path),
-                .bytes_transferred = state.bytes_transferred
-            };
-        }
-        if (code != CURLE_OK) {
-            std::string error_msg;
+            error = TransferError::DiskWrite;
+            error_msg = describe(state.failure, state.part_path);
+        } else if (code != CURLE_OK) {
             if (error_buffer[0] != '\0') {
                 error_msg = error_buffer;
             } else {
                 error_msg = curl_easy_strerror(code);
             }
-            return TransferResult{
-                .error = TransferError::Network,
-                .error_message = error_msg,
-                .bytes_transferred = state.bytes_transferred
-            };
+            error = TransferError::Network;
+        } else if (!is_success_status(http_status)) {
+            error = TransferError::HttpStatus;
+            error_msg = "download_once() failed: server responded with HTTP " + std::to_string(http_status);
         }
         return TransferResult{
-            .error = TransferError::None,
+            .error = error,
+            .http_status_code = http_status,
+            .error_message = error_msg,
             .bytes_transferred = state.bytes_transferred
         };
     }
