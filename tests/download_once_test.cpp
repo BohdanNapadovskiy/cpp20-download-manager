@@ -24,9 +24,13 @@ using dm::core::TransferResult;
 //     and the error page body never reaches the file;
 //   * redirects are followed; the result describes the final response;
 //   * a refused connection is TransferError::Network with a human-readable message;
+//   * a connection dropped in the middle of the body is TransferError::Network, never success:
+//     a truncated file must not be reported as downloaded;
 //   * a file that cannot be opened for writing is TransferError::DiskWrite.
 namespace {
     constexpr std::size_t file_size = 1024 * 1024;  // 1 MiB: many write-callback calls
+    constexpr std::size_t half_size = file_size / 2;
+    constexpr std::size_t chunk_size = 64 * 1024;    // half_size is a multiple of it
 
     std::string read_file(const fs::path& path) {
         std::ifstream in(path, std::ios::binary);
@@ -38,6 +42,7 @@ namespace {
     //   /missing  404 with an HTML error page
     //   /broken   500 with an HTML error page
     //   /old      301 -> /file
+    //   /half     200, announces 1 MiB but drops the connection after the first half
     class DownloadOnceTest : public dm::test::SandboxTest {
     protected:
         void SetUp() override {
@@ -57,6 +62,18 @@ namespace {
             });
             server.Get("/old", [](const httplib::Request&, httplib::Response& res) {
                 res.set_redirect("/file", 301);
+            });
+            server.Get("/half", [this](const httplib::Request&, httplib::Response& res) {
+                // Content-Length is the full size, so the client can tell the body is short.
+                res.set_content_provider(
+                        content_.size(), "application/octet-stream",
+                        [this](std::size_t offset, std::size_t, httplib::DataSink& sink) {
+                            if (offset >= half_size) {
+                                return false;  // abort: httplib closes the connection
+                            }
+                            sink.write(content_.data() + offset, chunk_size);
+                            return true;
+                        });
             });
             server_.start();
         }
@@ -164,6 +181,25 @@ namespace {
         EXPECT_EQ(result.error, TransferError::Network);
         EXPECT_EQ(result.http_status_code, 0) << "no response was received";
         EXPECT_FALSE(result.error_message.empty()) << "the user needs to know why it failed";
+    }
+
+    TEST_F(DownloadOnceTest, ConnectionDroppedMidBodyIsNetworkError) {
+        const TransferResult result = download("/half");
+
+        EXPECT_FALSE(result.ok()) << "a truncated download must never be reported as success";
+        EXPECT_EQ(result.error, TransferError::Network);
+        EXPECT_FALSE(result.error_message.empty()) << "the user needs to know why it failed";
+    }
+
+    TEST_F(DownloadOnceTest, ConnectionDroppedMidBodyKeepsReceivedPart) {
+        const TransferResult result = download("/half");
+
+        // The received half stays in the .part file: resuming (step 4) continues from it.
+        EXPECT_EQ(result.http_status_code, 200) << "headers arrived before the connection dropped";
+        EXPECT_EQ(result.bytes_transferred, half_size);
+        ASSERT_TRUE(fs::exists(part_path()));
+        EXPECT_TRUE(read_file(part_path()) == content_.substr(0, half_size))
+                << "the part file must hold exactly the bytes received before the drop";
     }
 
     TEST_F(DownloadOnceTest, UnwritablePathIsDiskWriteError) {
