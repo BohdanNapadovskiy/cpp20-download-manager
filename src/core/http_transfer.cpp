@@ -126,6 +126,9 @@ namespace dm::core {
         curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &state);
         curl_easy_setopt(handle.get(), CURLOPT_HEADERFUNCTION, header_callback);
         curl_easy_setopt(handle.get(), CURLOPT_HEADERDATA, &state);
+        curl_easy_setopt(handle.get(), CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(handle.get(), CURLOPT_MAXREDIRS, 10L);
+        curl_easy_setopt(handle.get(), CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
         const CURLcode code = curl_easy_perform(handle.get());
         auto info_code = curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response_code);
         if (info_code != CURLE_OK) {
