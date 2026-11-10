@@ -112,6 +112,24 @@ namespace dm::core {
             }
             return EasyHandle{handle};
         }
+
+        [[nodiscard]] bool is_tls_error(CURLcode code) noexcept {
+            switch (code) {
+                case CURLE_PEER_FAILED_VERIFICATION:
+                case CURLE_SSL_CONNECT_ERROR:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        std::string curl_error_message(const char *error_buffer, CURLcode code) {
+            if (error_buffer[0] != '\0') {
+                return error_buffer;
+            } else {
+                return curl_easy_strerror(code);
+            }
+        }
     }
 
     TransferResult download_once(const TransferRequest &request) {
@@ -119,7 +137,7 @@ namespace dm::core {
         char error_buffer[CURL_ERROR_SIZE];
         error_buffer[0] = '\0';
         long response_code = 0;
-        const long second  = static_cast<long>(request.connect_timeout.count());
+        const long connect_timeout_s = static_cast<long>(request.connect_timeout.count());
         FileWriteState state{.part_path = request.part_path};
         curl_easy_setopt(handle.get(), CURLOPT_URL, request.url.c_str());
         curl_easy_setopt(handle.get(), CURLOPT_ERRORBUFFER, error_buffer);
@@ -130,7 +148,9 @@ namespace dm::core {
         curl_easy_setopt(handle.get(), CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(handle.get(), CURLOPT_MAXREDIRS, 10L);
         curl_easy_setopt(handle.get(), CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
-        curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT, second);
+        curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT, connect_timeout_s);
+        curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYHOST, 2L);
         const CURLcode code = curl_easy_perform(handle.get());
         auto info_code = curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response_code);
         if (info_code != CURLE_OK) {
@@ -148,12 +168,12 @@ namespace dm::core {
         if (state.failure != WriteFailure::None) {
             error = TransferError::DiskWrite;
             error_msg = describe(state.failure, state.part_path);
+        } else if (is_tls_error(code)) {
+            error_msg = curl_error_message(error_buffer, code);
+            error = TransferError::Tls;
+            error_msg = "download_once() failed: TLS certificate issues: " + error_msg;
         } else if (code != CURLE_OK) {
-            if (error_buffer[0] != '\0') {
-                error_msg = error_buffer;
-            } else {
-                error_msg = curl_easy_strerror(code);
-            }
+            error_msg = curl_error_message(error_buffer, code);
             error = TransferError::Network;
         } else if (!is_success_status(http_status)) {
             error = TransferError::HttpStatus;
