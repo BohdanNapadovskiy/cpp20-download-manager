@@ -17,4 +17,16 @@ namespace dm::core {
         }
         *os << "TransferError(" << static_cast<int>(error) << ")";
     }
+
+    inline void PrintTo(TaskState state, std::ostream* os) {
+        switch (state) {
+            case TaskState::Queued:      *os << "Queued"; return;
+            case TaskState::Downloading: *os << "Downloading"; return;
+            case TaskState::Paused:      *os << "Paused"; return;
+            case TaskState::Canceled:    *os << "Canceled"; return;
+            case TaskState::Failed:      *os << "Failed"; return;
+            case TaskState::Completed:   *os << "Completed"; return;
+        }
+        *os << "TaskState(" << static_cast<int>(state) << ")";
+    }
 }
