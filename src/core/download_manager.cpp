@@ -10,6 +10,12 @@ namespace dm::core {
         }
     }
 
+    DownloadManager::~DownloadManager() {
+        for (auto &worker: workers_) {
+            worker.request_stop();
+        }
+    }
+
     TaskId DownloadManager::add(std::string url, std::filesystem::path target_path) {
         TaskId id{};
         {
@@ -88,7 +94,7 @@ namespace dm::core {
             bool has_data = cv_.wait(lock, stop_token, [&]() {
                 return !queue_.empty();
             });
-            if (!has_data) {
+            if (stop_token.stop_requested()) {
                 return;
             }
             std::string url;

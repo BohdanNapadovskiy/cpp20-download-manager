@@ -18,7 +18,7 @@ namespace dm::core {
     public:
         using Executor = std::function<decltype(download_once)>;
         explicit DownloadManager(Executor executor, std::size_t thread_count);
-        ~DownloadManager() = default;
+        ~DownloadManager();
         // Забороняємо копіювання та переміщення, щоб вказівник `this` у потоках залишався валідним
         DownloadManager(const DownloadManager &) = delete;
         DownloadManager &operator=(const DownloadManager &) = delete;
