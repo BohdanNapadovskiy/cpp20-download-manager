@@ -11,30 +11,61 @@ namespace dm::core {
     }
 
     TaskId DownloadManager::add(std::string url, std::filesystem::path target_path) {
-        std::lock_guard lock(mutex_);
-        TaskId id = next_id_++;
-        tasks_.emplace(id, TaskInfo{
-                           .id = id,
-                           .url = std::move(url),
-                           .state = TaskState::Queued,
-                           .target_path = std::move(target_path),
-                           .http_status_code = 0,
-                           .error_message{}
-                       });
-        queue_.emplace_back(id);
+        TaskId id{};
+        {
+            std::lock_guard lock(mutex_);
+            id = next_id_++;
+            tasks_.emplace(id, TaskInfo{
+                               .id = id,
+                               .url = std::move(url),
+                               .state = TaskState::Queued,
+                               .target_path = std::move(target_path),
+                           });
+            queue_.emplace_back(id);
+        }
         cv_.notify_one();
         return id;
     }
 
     bool DownloadManager::pause(TaskId id) {
+        std::lock_guard lock(mutex_);
+        auto it = tasks_.find(id);
+        if (it == tasks_.end()) {
+            return false;
+        }
+        if (it->second.state == TaskState::Queued) {
+            it->second.state = TaskState::Paused;
+            std::erase(queue_, id);
+            return true;
+        }
         return false;
     }
 
     bool DownloadManager::resume(TaskId id) {
-        return false;
+        {
+            std::lock_guard lock(mutex_);
+            auto it = tasks_.find(id);
+            if (it == tasks_.end() || it->second.state != TaskState::Paused) {
+                return false;
+            }
+            it->second.state = TaskState::Queued;
+            queue_.emplace_back(id);
+        }
+        cv_.notify_one();
+        return true;
     }
 
     bool DownloadManager::cancel(TaskId id) {
+        std::lock_guard lock(mutex_);
+        auto it = tasks_.find(id);
+        if (it == tasks_.end()) {
+            return false;
+        }
+        if (it->second.state == TaskState::Queued || it->second.state == TaskState::Paused) {
+            it->second.state = TaskState::Canceled;
+            std::erase(queue_, id);
+            return true;
+        }
         return false;
     }
 
