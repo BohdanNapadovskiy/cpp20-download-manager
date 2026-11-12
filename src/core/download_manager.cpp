@@ -77,21 +77,18 @@ namespace dm::core {
 
     std::vector<TaskInfo> DownloadManager::snapshot() const {
         std::lock_guard lock(mutex_);
-
         std::vector<TaskInfo> result;
         result.reserve(tasks_.size());
-
         for (const auto &[id, info]: tasks_) {
             result.push_back(info);
         }
-
         return result;
     }
 
     void DownloadManager::worker_loop(std::stop_token stop_token) {
         while (true) {
             std::unique_lock lock(mutex_);
-            bool has_data = cv_.wait(lock, stop_token, [&]() {
+            cv_.wait(lock, stop_token, [&]() {
                 return !queue_.empty();
             });
             if (stop_token.stop_requested()) {

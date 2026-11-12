@@ -105,6 +105,18 @@ namespace dm::core {
             }
         }
 
+        int xferinfo_callback(void* clientp,
+                      curl_off_t /*dltotal*/,
+                      curl_off_t /*dlnow*/,
+                      curl_off_t /*ultotal*/,
+                      curl_off_t /*ulnow*/) noexcept {
+            const auto* stop_token = static_cast<const std::stop_token*>(clientp);
+            if (stop_token != nullptr && stop_token->stop_requested()) {
+                return 1;
+            }
+            return 0;
+        }
+
         EasyHandle create_easy_handle() {
             CURL *handle = curl_easy_init();
             if (handle == nullptr) {
@@ -151,6 +163,9 @@ namespace dm::core {
         curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT, connect_timeout_s);
         curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+        curl_easy_setopt(handle.get(), CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(handle.get(), CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
+        curl_easy_setopt(handle.get(), CURLOPT_XFERINFODATA, &request.stop_token);
         const CURLcode code = curl_easy_perform(handle.get());
         auto info_code = curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response_code);
         if (info_code != CURLE_OK) {
@@ -169,9 +184,11 @@ namespace dm::core {
             error = TransferError::DiskWrite;
             error_msg = describe(state.failure, state.part_path);
         } else if (is_tls_error(code)) {
-            error_msg = curl_error_message(error_buffer, code);
             error = TransferError::Tls;
-            error_msg = "download_once() failed: TLS certificate issues: " + error_msg;
+            error_msg = "download_once() failed: TLS certificate issues: " + curl_error_message(error_buffer, code);
+        } else if (code == CURLE_ABORTED_BY_CALLBACK) {
+            error = TransferError::Aborted;
+            error_msg = "download_once() aborted: stop requested";
         } else if (code != CURLE_OK) {
             error_msg = curl_error_message(error_buffer, code);
             error = TransferError::Network;
