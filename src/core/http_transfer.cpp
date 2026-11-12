@@ -12,6 +12,11 @@
 
 namespace dm::core {
     namespace {
+        struct ProgressContext {
+            const std::stop_token *stop_token = nullptr;
+            const std::function<void(std::uint64_t, std::uint64_t)> *on_progress = nullptr;
+        };
+
         using EasyHandle = std::unique_ptr<CURL, decltype([](CURL *h) {
             curl_easy_cleanup(h);
         })>;
@@ -105,14 +110,27 @@ namespace dm::core {
             }
         }
 
-        int xferinfo_callback(void* clientp,
-                      curl_off_t /*dltotal*/,
-                      curl_off_t /*dlnow*/,
-                      curl_off_t /*ultotal*/,
-                      curl_off_t /*ulnow*/) noexcept {
-            const auto* stop_token = static_cast<const std::stop_token*>(clientp);
-            if (stop_token != nullptr && stop_token->stop_requested()) {
+        int xferinfo_callback(void *clientp,
+                              curl_off_t dltotal,
+                              curl_off_t dlnow,
+                              curl_off_t /*ultotal*/,
+                              curl_off_t /*ulnow*/) noexcept {
+            const auto *ctx = static_cast<const ProgressContext *>(clientp);
+            if (ctx == nullptr) {
+                return 0;
+            }
+            if (ctx->stop_token != nullptr && ctx->stop_token->stop_requested()) {
                 return 1;
+            }
+            try {
+                if (ctx->on_progress != nullptr && *ctx->on_progress) {
+                    const auto downloaded = dlnow > 0 ? static_cast<std::uint64_t>(dlnow) : std::uint64_t{0};
+                    const auto total = dltotal > 0 ? static_cast<std::uint64_t>(dltotal) : std::uint64_t{0};
+                    (*ctx->on_progress)(downloaded, total);
+                }
+            } catch (...) {
+                // Ігноруємо виняток спостерігача, щоб не переривати передачу
+                // і не маскувати збій під TransferError::Aborted
             }
             return 0;
         }
@@ -151,6 +169,7 @@ namespace dm::core {
         long response_code = 0;
         const long connect_timeout_s = static_cast<long>(request.connect_timeout.count());
         FileWriteState state{.part_path = request.part_path};
+        ProgressContext progress_context{.stop_token = &request.stop_token, .on_progress = &request.on_progress};
         curl_easy_setopt(handle.get(), CURLOPT_URL, request.url.c_str());
         curl_easy_setopt(handle.get(), CURLOPT_ERRORBUFFER, error_buffer);
         curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, write_callback);
@@ -165,7 +184,7 @@ namespace dm::core {
         curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYHOST, 2L);
         curl_easy_setopt(handle.get(), CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(handle.get(), CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
-        curl_easy_setopt(handle.get(), CURLOPT_XFERINFODATA, &request.stop_token);
+        curl_easy_setopt(handle.get(), CURLOPT_XFERINFODATA, &progress_context);
         const CURLcode code = curl_easy_perform(handle.get());
         auto info_code = curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response_code);
         if (info_code != CURLE_OK) {

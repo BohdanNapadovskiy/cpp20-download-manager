@@ -5,6 +5,7 @@
 #include <string>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <stop_token>
 
 namespace dm::core {
@@ -13,8 +14,8 @@ namespace dm::core {
         std::filesystem::path part_path;
         std::chrono::seconds connect_timeout = std::chrono::seconds(10);
         std::stop_token stop_token{};
+        std::function<void(std::uint64_t downloaded, std::uint64_t total)> on_progress{};
     };
-
     // Success means the body was received and written: 200 (full file) or 206 (resumed
     // range). Other 2xx codes are not a download: 204 has no body, so it would leave an
     // empty file that looks complete.
