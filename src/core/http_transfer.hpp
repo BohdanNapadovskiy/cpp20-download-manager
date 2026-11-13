@@ -15,6 +15,8 @@ namespace dm::core {
         std::chrono::seconds connect_timeout = std::chrono::seconds(10);
         std::stop_token stop_token{};
         std::function<void(std::uint64_t downloaded, std::uint64_t total)> on_progress{};
+        long low_speed_limit_bps = 10;
+        std::chrono::seconds low_speed_time = std::chrono::seconds(60);
     };
     // Success means the body was received and written: 200 (full file) or 206 (resumed
     // range). Other 2xx codes are not a download: 204 has no body, so it would leave an

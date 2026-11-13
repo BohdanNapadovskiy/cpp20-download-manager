@@ -52,7 +52,7 @@ namespace dm::core {
 
         std::size_t header_callback(char *ptr, std::size_t size, std::size_t count, void *data) {
             const std::size_t total_size = size * count;
-            FileWriteState *s = static_cast<FileWriteState *>(data);
+            auto *s = static_cast<FileWriteState *>(data);
 
             if (!s) {
                 return 0;
@@ -79,7 +79,7 @@ namespace dm::core {
         }
 
         std::size_t write_callback(char *ptr, std::size_t size, std::size_t nmemb, void *data) {
-            FileWriteState *s = static_cast<FileWriteState *>(data);
+            auto *s = static_cast<FileWriteState *>(data);
             try {
                 if (!s) {
                     return 0;
@@ -168,6 +168,7 @@ namespace dm::core {
         error_buffer[0] = '\0';
         long response_code = 0;
         const long connect_timeout_s = static_cast<long>(request.connect_timeout.count());
+        const long low_speed_time = static_cast<long>(request.low_speed_time.count());
         FileWriteState state{.part_path = request.part_path};
         ProgressContext progress_context{.stop_token = &request.stop_token, .on_progress = &request.on_progress};
         curl_easy_setopt(handle.get(), CURLOPT_URL, request.url.c_str());
@@ -185,6 +186,8 @@ namespace dm::core {
         curl_easy_setopt(handle.get(), CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(handle.get(), CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
         curl_easy_setopt(handle.get(), CURLOPT_XFERINFODATA, &progress_context);
+        curl_easy_setopt(handle.get(), CURLOPT_LOW_SPEED_LIMIT, request.low_speed_limit_bps);
+        curl_easy_setopt(handle.get(), CURLOPT_LOW_SPEED_TIME, low_speed_time);
         const CURLcode code = curl_easy_perform(handle.get());
         auto info_code = curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response_code);
         if (info_code != CURLE_OK) {

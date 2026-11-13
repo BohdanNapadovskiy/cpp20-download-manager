@@ -15,6 +15,7 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -24,20 +25,24 @@ using dm::core::TransferError;
 using dm::core::TransferRequest;
 using dm::core::TransferResult;
 
-// Behaviour checked by these tests (step 3.1 of docs/IMPLEMENTATION_PLAN.md):
+// Behaviour checked by these tests (steps 3.1 and 3.3 of docs/IMPLEMENTATION_PLAN.md):
 //   * request.stop_token interrupts a running download: the result is TransferError::Aborted,
 //     never success, and it comes back promptly instead of after the whole file;
 //   * the interruption works even while the server sends nothing (curl's progress callback
 //     runs without incoming data);
 //   * bytes received before the stop stay in the .part file, exactly as sent: resuming
 //     (step 4) continues from them;
-//   * a token that is already stopped aborts before anything is downloaded.
+//   * a token that is already stopped aborts before anything is downloaded;
+//   * a server that goes silent is cut after request.low_speed_time as TransferError::Network
+//     (a network problem worth retrying, not an abort), keeping the received bytes;
+//   * a fast download is never cut by the low-speed limit.
 namespace {
     constexpr std::size_t pattern_size = 1024 * 1024;        // content repeats with this period
     constexpr std::size_t chunk_size = 16 * 1024;            // pattern_size is a multiple of it
     constexpr std::size_t endless_size = 1024 * pattern_size; // 1 GiB announced, never fully sent
     constexpr std::size_t stall_after = 64 * 1024;           // /stall sends this much, then waits
     constexpr auto abort_deadline = 3s;  // curl's progress callback runs at least once a second
+    constexpr auto low_speed_deadline = 15s;   // see SilentServerTimesOutAsNetworkError
 
     std::string read_file(const fs::path& path) {
         std::ifstream in(path, std::ios::binary);
@@ -103,9 +108,17 @@ namespace {
 
         // Starts download_once on another thread with the test's stop token.
         std::future<TransferResult> start_download(const std::string& path) {
-            TransferRequest request{.url = server_.url(path), .part_path = part_path(),
-                                    .stop_token = stop_.get_token()};
-            return std::async(std::launch::async, [request] { return download_once(request); });
+            return start_download(request_for(path));
+        }
+
+        std::future<TransferResult> start_download(TransferRequest request) {
+            return std::async(std::launch::async,
+                              [request = std::move(request)] { return download_once(request); });
+        }
+
+        TransferRequest request_for(const std::string& path) const {
+            return TransferRequest{.url = server_.url(path), .part_path = part_path(),
+                                   .stop_token = stop_.get_token()};
         }
 
         // Waits for the download to finish. On a timeout the slow routes are released first:
@@ -212,6 +225,50 @@ namespace {
 
     TEST_F(DownloadOnceAbortTest, TokenThatIsNeverStoppedDoesNotDisturbDownload) {
         auto download = start_download("/file");
+        ASSERT_TRUE(finishes_in_time(download, 5s));
+
+        const TransferResult result = download.get();
+        EXPECT_TRUE(result.ok()) << "error message: " << result.error_message;
+        EXPECT_TRUE(read_file(part_path()) == pattern_);
+    }
+
+    // --- low-speed timeout (3.3) -----------------------------------------------------------
+
+    TEST_F(DownloadOnceAbortTest, SilentServerTimesOutAsNetworkError) {
+        TransferRequest request = request_for("/stall");
+        request.low_speed_time = 2s;   // nobody calls request_stop(): only the timeout can end it
+        const auto start = std::chrono::steady_clock::now();
+        auto download = start_download(std::move(request));
+
+        // curl averages the speed over a window of about 5 s, so the first 64 KiB keep it above
+        // the limit for a while: measured ~8 s in total. 15 s leaves room on a busy machine.
+        ASSERT_TRUE(finishes_in_time(download, low_speed_deadline))
+                << "a silent server must not hang the download";
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+
+        const TransferResult result = download.get();
+        EXPECT_EQ(result.error, TransferError::Network) << "too slow is a network problem, not an abort";
+        EXPECT_FALSE(result.ok());
+        EXPECT_FALSE(result.error_message.empty()) << "the user needs to know why it failed";
+        EXPECT_GE(elapsed, 1s) << "cut too early: the limit allows 2 s of silence";
+    }
+
+    TEST_F(DownloadOnceAbortTest, SilentServerTimeoutKeepsReceivedBytes) {
+        TransferRequest request = request_for("/stall");
+        request.low_speed_time = 2s;
+        auto download = start_download(std::move(request));
+        ASSERT_TRUE(finishes_in_time(download, low_speed_deadline));
+
+        const TransferResult result = download.get();
+        EXPECT_EQ(result.bytes_transferred, stall_after);
+        EXPECT_TRUE(read_file(part_path()) == expected_prefix(stall_after))
+                << "the received part must stay for resuming";
+    }
+
+    TEST_F(DownloadOnceAbortTest, FastDownloadIsNotCutByLowSpeedLimit) {
+        TransferRequest request = request_for("/file");
+        request.low_speed_time = 1s;    // the shortest window curl accepts
+        auto download = start_download(std::move(request));
         ASSERT_TRUE(finishes_in_time(download, 5s));
 
         const TransferResult result = download.get();
