@@ -25,17 +25,20 @@ using dm::core::TaskInfo;
 using dm::core::TaskState;
 using dm::test::FakeExecutor;
 
-// Behaviour checked by these tests (step 2 of docs/IMPLEMENTATION_PLAN.md, README "Поведінка",
-// docs/Table.md). The executor is a fake: no network, the test decides when a download ends.
+// Behaviour checked by these tests (steps 2 and 3.4 of docs/IMPLEMENTATION_PLAN.md, README
+// "Поведінка", docs/Table.md). The executor is a fake: no network, the test decides when a
+// download ends, and a held download reacts to its stop token like download_once.
 //   * add() returns a new id; the task is visible in snapshot() with its URL and target path;
 //   * the executor gets part_path = target_path + ".part"; on success the manager renames it
 //     to target_path and the task becomes Completed; on failure it becomes Failed and keeps
 //     the error message and HTTP status;
 //   * never more downloads at once than worker threads, and every worker is used;
 //   * pause/cancel work on queued tasks; resume puts a paused task at the END of the queue;
+//   * a running download can be paused (-> Paused, .part kept, resume downloads it again) or
+//     canceled (-> Canceled, .part deleted); other running downloads are not affected;
 //   * a forbidden action (unknown id, wrong state) returns false and changes nothing;
-//     in step 2 a running download cannot be paused or canceled yet (step 3 adds that);
-//   * the destructor stops and joins every worker, whether idle or busy.
+//   * the destructor stops and joins every worker, whether idle or busy; it interrupts running
+//     downloads instead of waiting for them, and starts no queued task.
 namespace {
     constexpr auto timeout = std::chrono::seconds(5);
 
@@ -44,18 +47,25 @@ namespace {
         return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     }
 
-    // Runs `action` on another thread; true if it finished within the timeout. A hanging
-    // action is detached so that the test reports a failure instead of hanging forever.
-    bool finishes_in_time(std::function<void()> action) {
-        std::promise<void> done;
-        std::future<void> finished = done.get_future();
-        std::thread worker([&action, &done] {
+    // Runs `action` on another thread; true if it finished within the timeout. On a timeout
+    // `rescue` (if given) unblocks the action and the thread is joined, so the test fails cleanly
+    // instead of leaving a thread that outlives the fixture. Without a rescue the hanging thread
+    // is detached: a failure report is better than a test run that never ends.
+    bool finishes_in_time(std::function<void()> action, const std::function<void()>& rescue = {}) {
+        auto done = std::make_shared<std::promise<void>>();
+        std::future<void> finished = done->get_future();
+        std::thread worker([action = std::move(action), done] {
             action();
-            done.set_value();
+            done->set_value();
         });
         if (finished.wait_for(timeout) == std::future_status::ready) {
             worker.join();
             return true;
+        }
+        if (rescue) {
+            rescue();
+            worker.join();
+            return false;
         }
         worker.detach();
         return false;
@@ -328,18 +338,103 @@ namespace {
         EXPECT_EQ(state(completed), TaskState::Completed);
     }
 
-    // Step 2 boundary: a running download cannot be interrupted yet. Step 3 (xferinfo callback)
-    // will allow Downloading -> Paused / Canceled and these expectations will change.
-    TEST_F(DownloadManagerTest, RunningTaskCannotBePausedOrCanceledYet) {
+    // --- pause / cancel a running download (3.4) ---------------------------------------------
+
+    TEST_F(DownloadManagerTest, RunningTaskCanBePaused) {
         fake_.block();
         start(1);
         const TaskId id = add("a.bin");
         ASSERT_TRUE(fake_.wait_started(1));
         ASSERT_TRUE(wait_for_state(id, TaskState::Downloading));
 
-        EXPECT_FALSE(manager_->pause(id));
-        EXPECT_FALSE(manager_->cancel(id));
-        EXPECT_EQ(state(id), TaskState::Downloading);
+        EXPECT_TRUE(manager_->pause(id));
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Paused)) << "the download was not interrupted";
+        EXPECT_EQ(fake_.aborted(), 1u);
+        EXPECT_FALSE(fs::exists(target("a.bin")));
+    }
+
+    TEST_F(DownloadManagerTest, PausedRunningTaskKeepsPartFile) {
+        fake_.block();
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Downloading));
+
+        ASSERT_TRUE(manager_->pause(id));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Paused));
+
+        const fs::path part = sandbox() / "a.bin.part";
+        ASSERT_TRUE(fs::exists(part)) << "pause keeps the .part file for resuming (README)";
+        EXPECT_EQ(read_file(part), FakeExecutor::partial_content());
+    }
+
+    TEST_F(DownloadManagerTest, PausedRunningTaskCanBeResumedAndCompleted) {
+        fake_.block();
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Downloading));
+        ASSERT_TRUE(manager_->pause(id));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Paused));
+
+        ASSERT_TRUE(manager_->resume(id));
+        ASSERT_TRUE(fake_.wait_started(2)) << "the resumed task must be downloaded again";
+        fake_.release();
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed))
+                << "a resumed task must not stay stopped: it needs a fresh stop source";
+        EXPECT_EQ(fake_.requests().size(), 2u) << "exactly one more download after resume";
+        EXPECT_EQ(fake_.aborted(), 1u) << "only the paused download was interrupted";
+        EXPECT_EQ(read_file(target("a.bin")), FakeExecutor::content_for(url("a.bin")));
+    }
+
+    TEST_F(DownloadManagerTest, RunningTaskCanBeCanceled) {
+        fake_.block();
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Downloading));
+
+        EXPECT_TRUE(manager_->cancel(id));
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Canceled)) << "the download was not interrupted";
+        EXPECT_FALSE(fs::exists(sandbox() / "a.bin.part")) << "cancel deletes the .part file (README)";
+        EXPECT_FALSE(fs::exists(target("a.bin")));
+    }
+
+    TEST_F(DownloadManagerTest, PausedRunningTaskCanBeCanceledAndLosesPartFile) {
+        fake_.block();
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Downloading));
+        ASSERT_TRUE(manager_->pause(id));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Paused));
+        ASSERT_TRUE(fs::exists(sandbox() / "a.bin.part"));
+
+        EXPECT_TRUE(manager_->cancel(id));
+
+        EXPECT_EQ(state(id), TaskState::Canceled);
+        EXPECT_FALSE(fs::exists(sandbox() / "a.bin.part")) << "cancel deletes the .part file (README)";
+    }
+
+    TEST_F(DownloadManagerTest, PausingOneRunningTaskDoesNotStopOthers) {
+        fake_.block();
+        start(2);
+        const TaskId paused = add("a.bin");
+        const TaskId other = add("b.bin");
+        ASSERT_TRUE(fake_.wait_started(2));
+        ASSERT_TRUE(wait_for_state(paused, TaskState::Downloading));
+        ASSERT_TRUE(wait_for_state(other, TaskState::Downloading));
+
+        ASSERT_TRUE(manager_->pause(paused));
+        ASSERT_TRUE(wait_for_state(paused, TaskState::Paused));
+        EXPECT_EQ(state(other), TaskState::Downloading) << "only the paused task is interrupted";
+
+        fake_.release();
+        EXPECT_TRUE(wait_for_state(other, TaskState::Completed));
+        EXPECT_EQ(fake_.aborted(), 1u);
     }
 
     // --- shutdown --------------------------------------------------------------------------
@@ -359,12 +454,32 @@ namespace {
         }
         ASSERT_TRUE(fake_.wait_started(1));
 
-        // The running download can only finish when the fake lets it go (step 2 cannot
-        // interrupt it), so release it while the destructor is waiting for the workers.
-        EXPECT_TRUE(finishes_in_time([this] {
-            std::thread releaser([this] { fake_.release(); });
-            manager_.reset();
-            releaser.join();
-        })) << "the destructor must stop the workers and join them";
+        // Releases the fake while the destructor runs, so this test also passes for a manager
+        // that waits for running downloads instead of interrupting them.
+        EXPECT_TRUE(finishes_in_time(
+                [this] {
+                    std::thread releaser([this] { fake_.release(); });
+                    manager_.reset();
+                    releaser.join();
+                },
+                [this] { fake_.release(); }))
+                << "the destructor must stop the workers and join them";
+    }
+
+    // Nobody releases the fake here: only the destructor's stop request can end the download.
+    TEST_F(DownloadManagerTest, DestructorInterruptsRunningDownloadsAndStartsNoQueuedTask) {
+        fake_.block();
+        start(2);
+        for (int i = 0; i < 5; ++i) {
+            add("file" + std::to_string(i) + ".bin");
+        }
+        ASSERT_TRUE(fake_.wait_started(2));
+
+        EXPECT_TRUE(finishes_in_time([this] { manager_.reset(); }, [this] { fake_.release(); }))
+                << "the destructor must interrupt running downloads instead of waiting for them";
+        EXPECT_EQ(fake_.aborted(), 2u) << "both running downloads were interrupted";
+        EXPECT_EQ(fake_.requests().size(), 2u) << "no queued task may start during shutdown";
+        EXPECT_TRUE(fs::exists(sandbox() / "file0.bin.part"))
+                << "an interrupted download keeps its .part: it continues after a restart (step 4)";
     }
 }

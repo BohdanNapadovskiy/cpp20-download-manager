@@ -43,6 +43,10 @@ namespace dm::core {
             it->second.info.state = TaskState::Paused;
             std::erase(queue_, id);
             return true;
+        } else if (it->second.info.state == TaskState::Downloading) {
+            it->second.stop_reason = StopReason::Paused;
+            it->second.stop.request_stop();
+            return true;
         }
         return false;
     }
@@ -54,6 +58,8 @@ namespace dm::core {
             if (it == tasks_.end() || it->second.info.state != TaskState::Paused) {
                 return false;
             }
+            it->second.stop = std::stop_source{};
+            it->second.stop_reason = StopReason::None;
             it->second.info.state = TaskState::Queued;
             queue_.emplace_back(id);
         }
@@ -62,17 +68,36 @@ namespace dm::core {
     }
 
     bool DownloadManager::cancel(TaskId id) {
-        std::lock_guard lock(mutex_);
-        auto it = tasks_.find(id);
-        if (it == tasks_.end()) {
-            return false;
+        std::filesystem::path target_path;
+        bool result = false;
+        {
+            std::lock_guard lock(mutex_);
+            auto it = tasks_.find(id);
+            if (it == tasks_.end()) {
+                return result;
+            }
+            if (it->second.info.state == TaskState::Queued) {
+                it->second.info.state = TaskState::Canceled;
+                std::erase(queue_, id);
+                target_path = it->second.info.target_path;
+                result = true;
+            } else if (it->second.info.state == TaskState::Paused) {
+                it->second.info.state = TaskState::Canceled;
+                target_path = it->second.info.target_path;
+                result = true;
+            } else if (it->second.info.state == TaskState::Downloading) {
+                it->second.stop_reason = StopReason::Canceled;
+                it->second.stop.request_stop();
+                result = true;
+            }
         }
-        if (it->second.info.state == TaskState::Queued || it->second.info.state == TaskState::Paused) {
-            it->second.info.state = TaskState::Canceled;
-            std::erase(queue_, id);
-            return true;
+        if (!target_path.empty()) {
+            std::error_code ec;
+            std::filesystem::path part_path = target_path;
+            part_path += ".part";
+            std::filesystem::remove(part_path, ec);
         }
-        return false;
+        return result;
     }
 
     std::vector<TaskInfo> DownloadManager::snapshot() const {
@@ -98,9 +123,11 @@ namespace dm::core {
             std::filesystem::path target_path;
             std::filesystem::path part_path;
             auto current_id = queue_.front();
+            std::stop_source task_stop;
             queue_.pop_front();
             auto it = tasks_.find(current_id);
             if (it != tasks_.end()) {
+                task_stop = it->second.stop;
                 it->second.info.state = TaskState::Downloading;
                 url = it->second.info.url;
                 target_path = it->second.info.target_path;
@@ -110,8 +137,16 @@ namespace dm::core {
                 continue;
             }
             lock.unlock();
-            auto request = TransferRequest{.url = std::move(url), .part_path = part_path};
-            TransferResult result = executor_(request);
+            auto request = TransferRequest{
+                .url = std::move(url), .part_path = part_path, .stop_token = task_stop.get_token()
+            };
+            TransferResult result;
+            {
+                std::stop_callback link_to_worker(stop_token, [&task_stop] {
+                    task_stop.request_stop();
+                });
+                result = executor_(request);
+            }
             std::error_code ec;
             if (result.ok()) {
                 std::filesystem::rename(part_path, target_path, ec);
@@ -126,6 +161,15 @@ namespace dm::core {
                 task_it->second.info.error_message = result.error_message;
                 if (result.ok() && !ec) {
                     task_it->second.info.state = TaskState::Completed;
+                } else if (result.error == TransferError::Aborted) {
+                    if (task_it->second.stop_reason == StopReason::Paused) {
+                        task_it->second.info.state = TaskState::Paused;
+                    } else if (task_it->second.stop_reason == StopReason::Canceled) {
+                        task_it->second.info.state = TaskState::Canceled;
+                        std::filesystem::remove(part_path, ec);
+                    } else {
+                        task_it->second.info.state = TaskState::Queued;
+                    }
                 } else {
                     task_it->second.info.state = TaskState::Failed;
                 }
