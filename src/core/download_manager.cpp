@@ -39,8 +39,8 @@ namespace dm::core {
         if (it == tasks_.end()) {
             return false;
         }
-        if (it->second.state == TaskState::Queued) {
-            it->second.state = TaskState::Paused;
+        if (it->second.info.state == TaskState::Queued) {
+            it->second.info.state = TaskState::Paused;
             std::erase(queue_, id);
             return true;
         }
@@ -51,10 +51,10 @@ namespace dm::core {
         {
             std::lock_guard lock(mutex_);
             auto it = tasks_.find(id);
-            if (it == tasks_.end() || it->second.state != TaskState::Paused) {
+            if (it == tasks_.end() || it->second.info.state != TaskState::Paused) {
                 return false;
             }
-            it->second.state = TaskState::Queued;
+            it->second.info.state = TaskState::Queued;
             queue_.emplace_back(id);
         }
         cv_.notify_one();
@@ -67,8 +67,8 @@ namespace dm::core {
         if (it == tasks_.end()) {
             return false;
         }
-        if (it->second.state == TaskState::Queued || it->second.state == TaskState::Paused) {
-            it->second.state = TaskState::Canceled;
+        if (it->second.info.state == TaskState::Queued || it->second.info.state == TaskState::Paused) {
+            it->second.info.state = TaskState::Canceled;
             std::erase(queue_, id);
             return true;
         }
@@ -79,8 +79,8 @@ namespace dm::core {
         std::lock_guard lock(mutex_);
         std::vector<TaskInfo> result;
         result.reserve(tasks_.size());
-        for (const auto &[id, info]: tasks_) {
-            result.push_back(info);
+        for (const auto &[id, task]: tasks_) {
+            result.push_back(task.info);
         }
         return result;
     }
@@ -101,9 +101,9 @@ namespace dm::core {
             queue_.pop_front();
             auto it = tasks_.find(current_id);
             if (it != tasks_.end()) {
-                it->second.state = TaskState::Downloading;
-                url = it->second.url;
-                target_path = it->second.target_path;
+                it->second.info.state = TaskState::Downloading;
+                url = it->second.info.url;
+                target_path = it->second.info.target_path;
                 part_path = target_path;
                 part_path += ".part";
             } else {
@@ -122,12 +122,12 @@ namespace dm::core {
             lock.lock();
             auto task_it = tasks_.find(current_id);
             if (task_it != tasks_.end()) {
-                task_it->second.http_status_code = result.http_status_code;
-                task_it->second.error_message = result.error_message;
+                task_it->second.info.http_status_code = result.http_status_code;
+                task_it->second.info.error_message = result.error_message;
                 if (result.ok() && !ec) {
-                    task_it->second.state = TaskState::Completed;
+                    task_it->second.info.state = TaskState::Completed;
                 } else {
-                    task_it->second.state = TaskState::Failed;
+                    task_it->second.info.state = TaskState::Failed;
                 }
             }
         }

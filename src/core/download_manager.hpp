@@ -30,13 +30,25 @@ namespace dm::core {
         [[nodiscard]] bool cancel(TaskId id);
         [[nodiscard]] std::vector<TaskInfo> snapshot() const;
     private:
+        enum class StopReason {
+            Paused,
+            Canceled,
+            None
+        };
+
+        struct Task {
+            TaskInfo info;
+            std::stop_source stop;
+            StopReason stop_reason = StopReason::None;
+        };
+
         void worker_loop(std::stop_token stop_token);
         Executor executor_;
         // mutable дозволяє блокувати м'ютекс усередині const-методу snapshot()
         mutable std::mutex mutex_;
         std::condition_variable_any cv_;
         TaskId next_id_{1};
-        std::unordered_map<TaskId, TaskInfo> tasks_;
+        std::unordered_map<TaskId, Task> tasks_;
         std::deque<TaskId> queue_;
 
         // Потоки ОБОВ'ЯЗКОВО останніми: вони знищаться першими,
