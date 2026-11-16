@@ -1,6 +1,7 @@
 #pragma once
 #include "core/types.hpp"
 #include "core/http_transfer.hpp"
+#include "core/speed_meter.hpp"
 #include <cstddef>
 #include <string>
 #include <filesystem>
@@ -40,6 +41,7 @@ namespace dm::core {
             TaskInfo info;
             std::stop_source stop;
             StopReason stop_reason = StopReason::None;
+            SpeedMeter speed_meter;
         };
 
         void worker_loop(std::stop_token stop_token);

@@ -21,6 +21,7 @@ namespace dm::test {
     //   * a call reports progress through request.on_progress like download_once: a held call
     //     reports (partial size, full size), a successful call reports (full size, full size),
     //     where full size is content_for(url).size();
+    //   * report_held(n) sends one more progress report from every held call;
     //   * wait_started(n) waits until n calls have begun;
     //   * the outcome depends on the URL: ".../fail" -> Network error, ".../404" -> HttpStatus,
     //     anything else -> 200 and the file content "content of <url>" written to part_path.
@@ -44,6 +45,20 @@ namespace dm::test {
                 blocked_ = false;
             }
             cv_.notify_all();
+        }
+
+        // Sends one more progress report (downloaded, full size) from every call held in block(),
+        // as if more data had arrived. Call it only while the calls are held: the requests
+        // belong to the running calls.
+        void report_held(std::size_t downloaded) {
+            std::vector<const core::TransferRequest*> held;
+            {
+                std::scoped_lock lock(mutex_);
+                held = held_;
+            }
+            for (const core::TransferRequest* request : held) {
+                report_progress(*request, downloaded, content_for(request->url).size());
+            }
         }
 
         // When false, a held call reports no progress: lets a test look at the progress a task has
@@ -102,8 +117,11 @@ namespace dm::test {
                     report_progress(request, partial_content().size(), content_for(request.url).size());
                 }
                 lock.lock();
+                held_.push_back(&request);
                 // false: the stop token was stopped before release() -> interrupted download
-                if (!cv_.wait(lock, request.stop_token, [&] { return !blocked_; })) {
+                const bool released = cv_.wait(lock, request.stop_token, [&] { return !blocked_; });
+                std::erase(held_, &request);
+                if (!released) {
                     --active_;
                     ++aborted_;
                     return {.error = core::TransferError::Aborted,
@@ -147,6 +165,7 @@ namespace dm::test {
         std::condition_variable_any cv_;   // _any: it also wakes on request.stop_token
         bool blocked_ = false;
         bool report_partial_ = true;
+        std::vector<const core::TransferRequest*> held_;   // calls waiting in block()
         std::size_t active_ = 0;
         std::size_t max_active_ = 0;
         std::size_t aborted_ = 0;

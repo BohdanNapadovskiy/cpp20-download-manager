@@ -33,5 +33,6 @@ namespace dm::core {
         std::string error_message{};
         std::uint64_t downloaded_bytes = 0;
         std::uint64_t total_bytes = 0;
+        std::uint64_t speed_bps = 0;
     };
 }

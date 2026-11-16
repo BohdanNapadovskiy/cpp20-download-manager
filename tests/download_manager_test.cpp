@@ -40,6 +40,7 @@ using dm::test::FakeExecutor;
 //   * a forbidden action (unknown id, wrong state) returns false and changes nothing;
 //   * snapshot() shows the progress reported by the executor (downloaded / total size, 0 = not
 //     known yet), separately for every task; a new attempt starts again from zero;
+//   * snapshot() shows the speed while downloading and 0 in every other state;
 //   * the destructor stops and joins every worker, whether idle or busy; it interrupts running
 //     downloads instead of waiting for them, and starts no queued task.
 namespace {
@@ -113,6 +114,25 @@ namespace {
         // thread). Returns false after the timeout instead of hanging.
         bool wait_for_state(TaskId id, TaskState expected) const {
             return wait_until(id, [expected](const TaskInfo& info) { return info.state == expected; });
+        }
+
+        // Starts one held download of "a.bin" and makes its speed non-zero: a first progress
+        // report, a real pause of just over a second, then a second report with more bytes.
+        // The second report stays below the full size, so the final report of a completed
+        // download keeps the measured speed instead of restarting the meter.
+        TaskId start_with_measurable_speed() {
+            fake_.block();
+            start(1);
+            const TaskId id = add("a.bin");
+            EXPECT_TRUE(fake_.wait_started(1));
+            EXPECT_TRUE(wait_until(id, [](const TaskInfo& info) { return info.downloaded_bytes > 0; }));
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // one full speed window
+            fake_.report_held(FakeExecutor::content_for(url("a.bin")).size() - 1);
+
+            EXPECT_TRUE(wait_until(id, [](const TaskInfo& info) { return info.speed_bps > 0; }))
+                    << "the manager must pass progress to its SpeedMeter";
+            return id;
         }
 
         // Polls snapshot() until the task satisfies `condition`; false after the timeout.
@@ -518,6 +538,47 @@ namespace {
         const auto info = find(id);
         EXPECT_EQ(info->downloaded_bytes, 0u) << "a new attempt starts from zero, not from the old numbers";
         EXPECT_EQ(info->total_bytes, 0u);
+    }
+
+    // --- speed (3.4b) ----------------------------------------------------------------------
+    // The manager measures speed with the real clock over windows of 1 s, so a non-zero speed
+    // needs two progress reports more than a second apart: these tests wait once, just over a
+    // second. The speed arithmetic itself is tested without waiting in speed_meter_test.cpp.
+
+    TEST_F(DownloadManagerTest, NewTaskHasNoSpeed) {
+        fake_.block();
+        start(1);
+        add("a.bin");
+        const TaskId waiting = add("b.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+
+        EXPECT_EQ(find(waiting)->speed_bps, 0u);
+    }
+
+    TEST_F(DownloadManagerTest, SpeedIsVisibleWhileDownloading) {
+        const TaskId id = start_with_measurable_speed();
+
+        const auto info = find(id);
+        EXPECT_EQ(info->state, TaskState::Downloading);
+        EXPECT_GT(info->speed_bps, 0u) << "two progress reports over a second apart give a speed";
+        EXPECT_LE(info->speed_bps, FakeExecutor::content_for(url("a.bin")).size())
+                << "fewer bytes than the whole body arrived in more than a second";
+    }
+
+    TEST_F(DownloadManagerTest, CompletedTaskHasZeroSpeed) {
+        const TaskId id = start_with_measurable_speed();
+
+        fake_.release();
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        EXPECT_EQ(find(id)->speed_bps, 0u) << "a finished download is not downloading at any speed";
+    }
+
+    TEST_F(DownloadManagerTest, PausedTaskHasZeroSpeed) {
+        const TaskId id = start_with_measurable_speed();
+
+        ASSERT_TRUE(manager_->pause(id));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Paused));
+        EXPECT_EQ(find(id)->speed_bps, 0u) << "a paused download is not downloading at any speed";
     }
 
     // --- shutdown --------------------------------------------------------------------------

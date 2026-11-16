@@ -131,6 +131,8 @@ namespace dm::core {
                 it->second.info.state = TaskState::Downloading;
                 it->second.info.downloaded_bytes = 0;
                 it->second.info.total_bytes = 0;
+                it->second.info.speed_bps = 0;
+                it->second.speed_meter.start(SpeedMeter::Clock::now());
                 url = it->second.info.url;
                 target_path = it->second.info.target_path;
                 part_path = target_path;
@@ -143,12 +145,14 @@ namespace dm::core {
                 .url = std::move(url),
                 .part_path = part_path,
                 .stop_token = task_stop.get_token(),
-                .on_progress = [this, current_id] (std::uint64_t downloaded, std::uint64_t total) {
+                .on_progress = [this, current_id](std::uint64_t downloaded, std::uint64_t total) {
                     std::lock_guard progress_lock(mutex_);
                     auto task_it = tasks_.find(current_id);
                     if (task_it != tasks_.end()) {
                         task_it->second.info.downloaded_bytes = downloaded;
                         task_it->second.info.total_bytes = total;
+                        task_it->second.info.speed_bps = task_it->second.speed_meter.update(
+                            downloaded, SpeedMeter::Clock::now());
                     }
                 }
             };
@@ -185,6 +189,7 @@ namespace dm::core {
                 } else {
                     task_it->second.info.state = TaskState::Failed;
                 }
+                task_it->second.info.speed_bps = 0;
             }
         }
     }
