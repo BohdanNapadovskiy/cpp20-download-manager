@@ -27,6 +27,7 @@ set(DM_CORE_SOURCES
         src/core/resume.cpp
         src/core/retry.cpp
         src/core/state_store.cpp
+        src/core/speed_meter.cpp
 )
 
 include(FetchContent)
