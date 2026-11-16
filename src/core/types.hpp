@@ -31,5 +31,7 @@ namespace dm::core {
         std::filesystem::path target_path{};
         int http_status_code = 0;
         std::string error_message{};
+        std::uint64_t downloaded_bytes = 0;
+        std::uint64_t total_bytes = 0;
     };
 }

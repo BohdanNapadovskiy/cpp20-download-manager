@@ -18,6 +18,9 @@ namespace dm::test {
     //   * a call honours request.stop_token like download_once: a token stopped before the call
     //     aborts at once; a held call that is stopped returns TransferError::Aborted and leaves
     //     the partial .part file;
+    //   * a call reports progress through request.on_progress like download_once: a held call
+    //     reports (partial size, full size), a successful call reports (full size, full size),
+    //     where full size is content_for(url).size();
     //   * wait_started(n) waits until n calls have begun;
     //   * the outcome depends on the URL: ".../fail" -> Network error, ".../404" -> HttpStatus,
     //     anything else -> 200 and the file content "content of <url>" written to part_path.
@@ -41,6 +44,13 @@ namespace dm::test {
                 blocked_ = false;
             }
             cv_.notify_all();
+        }
+
+        // When false, a held call reports no progress: lets a test look at the progress a task has
+        // right after a download starts, before the executor reports anything.
+        void set_report_partial(bool report) {
+            std::scoped_lock lock(mutex_);
+            report_partial_ = report;
         }
 
         // False if fewer than `count` calls started within the timeout.
@@ -85,8 +95,12 @@ namespace dm::test {
             }
 
             if (blocked_) {
+                const bool report = report_partial_;
                 lock.unlock();
                 std::ofstream(request.part_path, std::ios::binary) << partial_content();
+                if (report) {
+                    report_progress(request, partial_content().size(), content_for(request.url).size());
+                }
                 lock.lock();
                 // false: the stop token was stopped before release() -> interrupted download
                 if (!cv_.wait(lock, request.stop_token, [&] { return !blocked_; })) {
@@ -116,13 +130,23 @@ namespace dm::test {
             }
             const std::string body = content_for(request.url);
             std::ofstream(request.part_path, std::ios::binary) << body;
+            report_progress(request, body.size(), body.size());
             return {.error = core::TransferError::None, .http_status_code = 200,
                     .bytes_transferred = body.size()};
+        }
+
+        // Called without the fake's own lock held, like download_once calls on_progress.
+        static void report_progress(const core::TransferRequest& request, std::size_t downloaded,
+                                    std::size_t total) {
+            if (request.on_progress) {
+                request.on_progress(downloaded, total);
+            }
         }
 
         mutable std::mutex mutex_;
         std::condition_variable_any cv_;   // _any: it also wakes on request.stop_token
         bool blocked_ = false;
+        bool report_partial_ = true;
         std::size_t active_ = 0;
         std::size_t max_active_ = 0;
         std::size_t aborted_ = 0;

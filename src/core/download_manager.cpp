@@ -129,6 +129,8 @@ namespace dm::core {
             if (it != tasks_.end()) {
                 task_stop = it->second.stop;
                 it->second.info.state = TaskState::Downloading;
+                it->second.info.downloaded_bytes = 0;
+                it->second.info.total_bytes = 0;
                 url = it->second.info.url;
                 target_path = it->second.info.target_path;
                 part_path = target_path;
@@ -138,7 +140,17 @@ namespace dm::core {
             }
             lock.unlock();
             auto request = TransferRequest{
-                .url = std::move(url), .part_path = part_path, .stop_token = task_stop.get_token()
+                .url = std::move(url),
+                .part_path = part_path,
+                .stop_token = task_stop.get_token(),
+                .on_progress = [this, current_id] (std::uint64_t downloaded, std::uint64_t total) {
+                    std::lock_guard progress_lock(mutex_);
+                    auto task_it = tasks_.find(current_id);
+                    if (task_it != tasks_.end()) {
+                        task_it->second.info.downloaded_bytes = downloaded;
+                        task_it->second.info.total_bytes = total;
+                    }
+                }
             };
             TransferResult result;
             {

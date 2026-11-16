@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -37,6 +38,8 @@ using dm::test::FakeExecutor;
 //   * a running download can be paused (-> Paused, .part kept, resume downloads it again) or
 //     canceled (-> Canceled, .part deleted); other running downloads are not affected;
 //   * a forbidden action (unknown id, wrong state) returns false and changes nothing;
+//   * snapshot() shows the progress reported by the executor (downloaded / total size, 0 = not
+//     known yet), separately for every task; a new attempt starts again from zero;
 //   * the destructor stops and joins every worker, whether idle or busy; it interrupts running
 //     downloads instead of waiting for them, and starts no queued task.
 namespace {
@@ -109,10 +112,15 @@ namespace {
         // Polls snapshot() until the task reaches `expected` (the state changes on a worker
         // thread). Returns false after the timeout instead of hanging.
         bool wait_for_state(TaskId id, TaskState expected) const {
+            return wait_until(id, [expected](const TaskInfo& info) { return info.state == expected; });
+        }
+
+        // Polls snapshot() until the task satisfies `condition`; false after the timeout.
+        bool wait_until(TaskId id, const std::function<bool(const TaskInfo&)>& condition) const {
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             while (std::chrono::steady_clock::now() < deadline) {
                 const auto info = find(id);
-                if (info && info->state == expected) {
+                if (info && condition(*info)) {
                     return true;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -435,6 +443,81 @@ namespace {
         fake_.release();
         EXPECT_TRUE(wait_for_state(other, TaskState::Completed));
         EXPECT_EQ(fake_.aborted(), 1u);
+    }
+
+    // --- progress (3.4b) ------------------------------------------------------------------
+
+    TEST_F(DownloadManagerTest, NewTaskHasNoProgress) {
+        fake_.block();
+        start(1);
+        add("a.bin");
+        const TaskId waiting = add("b.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+
+        const auto info = find(waiting);
+        ASSERT_TRUE(info.has_value());
+        EXPECT_EQ(info->downloaded_bytes, 0u);
+        EXPECT_EQ(info->total_bytes, 0u) << "0 means the size is not known yet";
+    }
+
+    TEST_F(DownloadManagerTest, ProgressIsVisibleWhileDownloading) {
+        fake_.block();
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+
+        const std::uint64_t partial = FakeExecutor::partial_content().size();
+        const std::uint64_t full = FakeExecutor::content_for(url("a.bin")).size();
+        EXPECT_TRUE(wait_until(id, [&](const TaskInfo& info) {
+            return info.state == TaskState::Downloading && info.downloaded_bytes == partial;
+        })) << "on_progress from the executor must reach snapshot() during the download";
+        EXPECT_EQ(find(id)->total_bytes, full);
+    }
+
+    TEST_F(DownloadManagerTest, CompletedTaskShowsFullProgress) {
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+
+        const std::uint64_t full = FakeExecutor::content_for(url("a.bin")).size();
+        const auto info = find(id);
+        EXPECT_EQ(info->downloaded_bytes, full);
+        EXPECT_EQ(info->total_bytes, full);
+    }
+
+    TEST_F(DownloadManagerTest, ProgressIsKeptPerTask) {
+        fake_.block();
+        start(2);
+        const TaskId small = add("a.bin");
+        const TaskId large = add("a-much-longer-file-name.bin");   // longer URL -> larger fake body
+        ASSERT_TRUE(fake_.wait_started(2));
+        fake_.release();
+        ASSERT_TRUE(wait_for_state(small, TaskState::Completed));
+        ASSERT_TRUE(wait_for_state(large, TaskState::Completed));
+
+        EXPECT_EQ(find(small)->total_bytes, FakeExecutor::content_for(url("a.bin")).size());
+        EXPECT_EQ(find(large)->total_bytes,
+                  FakeExecutor::content_for(url("a-much-longer-file-name.bin")).size())
+                << "each task must get the progress of its own download";
+    }
+
+    TEST_F(DownloadManagerTest, ResumedTaskStartsProgressFromZero) {
+        fake_.block();
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+        ASSERT_TRUE(wait_until(id, [](const TaskInfo& info) { return info.downloaded_bytes > 0; }));
+        ASSERT_TRUE(manager_->pause(id));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Paused));
+
+        fake_.set_report_partial(false);   // the second attempt reports nothing while held
+        ASSERT_TRUE(manager_->resume(id));
+        ASSERT_TRUE(fake_.wait_started(2));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Downloading));
+
+        const auto info = find(id);
+        EXPECT_EQ(info->downloaded_bytes, 0u) << "a new attempt starts from zero, not from the old numbers";
+        EXPECT_EQ(info->total_bytes, 0u);
     }
 
     // --- shutdown --------------------------------------------------------------------------
