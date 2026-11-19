@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -116,9 +117,13 @@ namespace {
                               [request = std::move(request)] { return download_once(request); });
         }
 
-        TransferRequest request_for(const std::string& path) const {
+        // Every request reports its progress into received_, see wait_for_received().
+        TransferRequest request_for(const std::string& path) {
             return TransferRequest{.url = server_.url(path), .part_path = part_path(),
-                                   .stop_token = stop_.get_token()};
+                                   .stop_token = stop_.get_token(),
+                                   .on_progress = [this](std::uint64_t downloaded, std::uint64_t) {
+                                       received_ = downloaded;
+                                   }};
         }
 
         // Waits for the download to finish. On a timeout the slow routes are released first:
@@ -128,6 +133,20 @@ namespace {
                 return true;
             }
             stopping_ = true;
+            return false;
+        }
+
+        // Waits until download_once reports at least `bytes` received; false after a timeout.
+        // Not the size of the .part file: the writer may keep the last bytes in its buffer until
+        // the file is closed, and a server that stops sending never makes it write them out.
+        bool wait_for_received(std::uint64_t bytes) const {
+            const auto deadline = std::chrono::steady_clock::now() + 5s;
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (received_ >= bytes) {
+                    return true;
+                }
+                std::this_thread::sleep_for(1ms);
+            }
             return false;
         }
 
@@ -155,6 +174,7 @@ namespace {
 
         const std::string pattern_ = dm::test::make_content(pattern_size);
         std::atomic<bool> stopping_{false};
+        std::atomic<std::uint64_t> received_{0};   // last downloaded count from on_progress
         std::stop_source stop_;
         dm::test::TestServer server_;
     };
@@ -195,7 +215,7 @@ namespace {
 
     TEST_F(DownloadOnceAbortTest, StopWhileServerIsSilentIsAborted) {
         auto download = start_download("/stall");
-        ASSERT_TRUE(wait_for_part_size(stall_after)) << "the first chunk never arrived";
+        ASSERT_TRUE(wait_for_received(stall_after)) << "the first chunk never arrived";
 
         stop_.request_stop();
         ASSERT_TRUE(finishes_in_time(download, abort_deadline))
