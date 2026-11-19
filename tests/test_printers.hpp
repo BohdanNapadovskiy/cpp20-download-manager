@@ -26,6 +26,7 @@ namespace dm::core {
             case TaskState::Paused:      *os << "Paused"; return;
             case TaskState::Canceled:    *os << "Canceled"; return;
             case TaskState::Failed:      *os << "Failed"; return;
+            case TaskState::Retrying:    *os << "Retrying"; return;
             case TaskState::Completed:   *os << "Completed"; return;
         }
         *os << "TaskState(" << static_cast<int>(state) << ")";

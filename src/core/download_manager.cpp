@@ -1,7 +1,10 @@
 #include "core/download_manager.hpp"
+#include <optional>
 
 namespace dm::core {
-    DownloadManager::DownloadManager(Executor executor, std::size_t thread_count) : executor_(std::move(executor)) {
+    DownloadManager::DownloadManager(Executor executor, std::size_t thread_count,
+                                     RetryPolicy retry_policy) : executor_(std::move(executor)),
+                                                                 retry_policy_(retry_policy) {
         workers_.reserve(thread_count);
         for (std::size_t i = 0; i < thread_count; ++i) {
             workers_.emplace_back([this](std::stop_token stop_token) {
@@ -43,7 +46,7 @@ namespace dm::core {
             it->second.info.state = TaskState::Paused;
             std::erase(queue_, id);
             return true;
-        } else if (it->second.info.state == TaskState::Downloading) {
+        } else if (it->second.info.state == TaskState::Downloading || it->second.info.state == TaskState::Retrying) {
             it->second.stop_reason = StopReason::Paused;
             it->second.stop.request_stop();
             return true;
@@ -59,6 +62,7 @@ namespace dm::core {
                 return false;
             }
             it->second.stop = std::stop_source{};
+            it->second.info.attempt = 0;
             it->second.stop_reason = StopReason::None;
             it->second.info.state = TaskState::Queued;
             queue_.emplace_back(id);
@@ -85,7 +89,8 @@ namespace dm::core {
                 it->second.info.state = TaskState::Canceled;
                 target_path = it->second.info.target_path;
                 result = true;
-            } else if (it->second.info.state == TaskState::Downloading) {
+            } else if (it->second.info.state == TaskState::Downloading || it->second.info.state ==
+                       TaskState::Retrying) {
                 it->second.stop_reason = StopReason::Canceled;
                 it->second.stop.request_stop();
                 result = true;
@@ -110,79 +115,96 @@ namespace dm::core {
         return result;
     }
 
-    void DownloadManager::worker_loop(std::stop_token stop_token) {
+    std::optional<DownloadManager::Job> DownloadManager::take_next(std::stop_token stop_token) {
+        std::unique_lock lock(mutex_);
         while (true) {
-            std::unique_lock lock(mutex_);
             cv_.wait(lock, stop_token, [&]() {
                 return !queue_.empty();
             });
             if (stop_token.stop_requested()) {
-                return;
+                return std::nullopt;
             }
-            std::string url;
-            std::filesystem::path target_path;
-            std::filesystem::path part_path;
             auto current_id = queue_.front();
-            std::stop_source task_stop;
             queue_.pop_front();
             auto it = tasks_.find(current_id);
-            if (it != tasks_.end()) {
-                task_stop = it->second.stop;
-                it->second.info.state = TaskState::Downloading;
-                it->second.info.downloaded_bytes = 0;
-                it->second.info.total_bytes = 0;
-                it->second.info.speed_bps = 0;
-                it->second.speed_meter.start(SpeedMeter::Clock::now());
-                url = it->second.info.url;
-                target_path = it->second.info.target_path;
-                part_path = target_path;
-                part_path += ".part";
-            } else {
+            if (it == tasks_.end()) {
                 continue;
             }
-            lock.unlock();
-            auto request = TransferRequest{
-                .url = std::move(url),
+            it->second.info.state = TaskState::Downloading;
+            it->second.info.downloaded_bytes = 0;
+            it->second.info.total_bytes = 0;
+            it->second.info.speed_bps = 0;
+            it->second.speed_meter.start(SpeedMeter::Clock::now());
+            std::filesystem::path part_path = it->second.info.target_path;
+            part_path += ".part";
+            return Job{
+                .id = current_id,
+                .url = it->second.info.url,
+                .target_path = it->second.info.target_path,
                 .part_path = part_path,
-                .stop_token = task_stop.get_token(),
-                .on_progress = [this, current_id](std::uint64_t downloaded, std::uint64_t total) {
-                    std::lock_guard progress_lock(mutex_);
-                    auto task_it = tasks_.find(current_id);
-                    if (task_it != tasks_.end()) {
-                        task_it->second.info.downloaded_bytes = downloaded;
-                        task_it->second.info.total_bytes = total;
-                        task_it->second.info.speed_bps = task_it->second.speed_meter.update(
-                            downloaded, SpeedMeter::Clock::now());
-                    }
-                }
+                .task_stop = it->second.stop
             };
-            TransferResult result;
-            {
-                std::stop_callback link_to_worker(stop_token, [&task_stop] {
-                    task_stop.request_stop();
-                });
-                result = executor_(request);
-            }
-            std::error_code ec;
-            if (result.ok()) {
-                std::filesystem::rename(part_path, target_path, ec);
-                if (ec) {
-                    result.error_message = "rename() failed: " + ec.message();
+        }
+    }
+
+    TransferResult DownloadManager::download_with_retries(Job &job, std::stop_token stop_token) {
+        auto current_id = job.id;
+        auto request = TransferRequest{
+            .url = job.url,
+            .part_path = job.part_path,
+            .stop_token = job.task_stop.get_token(),
+            .on_progress = [this, current_id](std::uint64_t downloaded, std::uint64_t total) {
+                std::lock_guard progress_lock(mutex_);
+                auto task_it = tasks_.find(current_id);
+                if (task_it != tasks_.end()) {
+                    task_it->second.info.downloaded_bytes = downloaded;
+                    task_it->second.info.total_bytes = total;
+                    task_it->second.info.speed_bps = task_it->second.speed_meter.update(
+                        downloaded, SpeedMeter::Clock::now());
                 }
             }
-            lock.lock();
-            auto task_it = tasks_.find(current_id);
+        };
+        TransferResult result;
+        {
+            std::stop_callback link_to_worker(stop_token, [&job] {
+                job.task_stop.request_stop();
+            });
+            result = executor_(request);
+        }
+        return result;
+    }
+
+    void DownloadManager::begin_attempt(TaskId task_id, std::uint32_t attempt) {
+        std::unique_lock lock(mutex_);
+    }
+
+    bool DownloadManager::wait_before_retry() {
+        return false;
+    }
+
+    void DownloadManager::finish(const Job &job, TransferResult &transfer_result) {
+        std::error_code ec;
+        if (transfer_result.ok()) {
+            std::filesystem::rename(job.part_path, job.target_path, ec);
+            if (ec) {
+                transfer_result.error_message = "rename() failed: " + ec.message();
+            }
+        }
+        bool need_remove = false;
+        {
+            std::lock_guard lock(mutex_);
+            auto task_it = tasks_.find(job.id);
             if (task_it != tasks_.end()) {
-                task_it->second.info.http_status_code = result.http_status_code;
-                task_it->second.info.error_message = result.error_message;
-                if (result.ok() && !ec) {
+                task_it->second.info.http_status_code = transfer_result.http_status_code;
+                task_it->second.info.error_message = transfer_result.error_message;
+                if (transfer_result.ok() && !ec) {
                     task_it->second.info.state = TaskState::Completed;
-                } else if (result.error == TransferError::Aborted) {
+                } else if (transfer_result.error == TransferError::Aborted) {
                     if (task_it->second.stop_reason == StopReason::Paused) {
                         task_it->second.info.state = TaskState::Paused;
                     } else if (task_it->second.stop_reason == StopReason::Canceled) {
                         task_it->second.info.state = TaskState::Canceled;
-                        std::filesystem::remove(part_path, ec);
+                        need_remove = true;
                     } else {
                         task_it->second.info.state = TaskState::Queued;
                     }
@@ -191,6 +213,17 @@ namespace dm::core {
                 }
                 task_it->second.info.speed_bps = 0;
             }
+        }
+        if (need_remove) {
+            std::error_code error_code;
+            std::filesystem::remove(job.part_path, error_code);
+        }
+    }
+
+    void DownloadManager::worker_loop(std::stop_token stop_token) {
+        while (auto task = take_next(stop_token)) {
+            auto result = download_with_retries(*task, stop_token);
+            finish(*task, result);
         }
     }
 }
