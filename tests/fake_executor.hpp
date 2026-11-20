@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -24,7 +26,9 @@ namespace dm::test {
     //   * report_held(n) sends one more progress report from every held call;
     //   * wait_started(n) waits until n calls have begun;
     //   * the outcome depends on the URL: ".../fail" -> Network error, ".../404" -> HttpStatus,
-    //     anything else -> 200 and the file content "content of <url>" written to part_path.
+    //     anything else -> 200 and the file content "content of <url>" written to part_path;
+    //   * fail_next(url, result) makes the next call for that URL return `result` instead, once;
+    //     several fail_next calls are used up in order, then the URL behaves as usual again.
     // Records peak concurrency, every request, the order in which calls started and the number
     // of calls that ended as Aborted.
     class FakeExecutor {
@@ -45,6 +49,14 @@ namespace dm::test {
                 blocked_ = false;
             }
             cv_.notify_all();
+        }
+
+        // The next call for `url` returns `result` without downloading anything. Queued per URL:
+        // fail_next(u, a); fail_next(u, b) -> the first call gets a, the second b, the third
+        // downloads as usual.
+        void fail_next(const std::string& url, core::TransferResult result) {
+            std::scoped_lock lock(mutex_);
+            scripted_[url].push_back(std::move(result));
         }
 
         // Sends one more progress report (downloaded, full size) from every call held in block(),
@@ -82,6 +94,12 @@ namespace dm::test {
         std::vector<core::TransferRequest> requests() const {
             std::scoped_lock lock(mutex_);
             return requests_;
+        }
+
+        // How many calls were made for `url`.
+        std::size_t calls_for(const std::string& url) const {
+            std::scoped_lock lock(mutex_);
+            return static_cast<std::size_t>(std::ranges::count(requests_, url, &core::TransferRequest::url));
         }
 
         std::size_t aborted() const {
@@ -128,6 +146,14 @@ namespace dm::test {
                             .error_message = "fake: stop requested"};
                 }
             }
+
+            if (auto scripted = scripted_.find(request.url);
+                scripted != scripted_.end() && !scripted->second.empty()) {
+                core::TransferResult result = std::move(scripted->second.front());
+                scripted->second.pop_front();
+                --active_;
+                return result;
+            }
             lock.unlock();
 
             core::TransferResult result = outcome(request);
@@ -170,5 +196,6 @@ namespace dm::test {
         std::size_t max_active_ = 0;
         std::size_t aborted_ = 0;
         std::vector<core::TransferRequest> requests_;
+        std::map<std::string, std::deque<core::TransferResult>> scripted_;   // fail_next()
     };
 }

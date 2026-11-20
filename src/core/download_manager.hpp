@@ -25,16 +25,26 @@ namespace dm::core {
                                  std::size_t thread_count, RetryPolicy retry_policy = RetryPolicy{});
 
         ~DownloadManager();
+
         // Забороняємо копіювання та переміщення, щоб вказівник `this` у потоках залишався валідним
         DownloadManager(const DownloadManager &) = delete;
+
         DownloadManager &operator=(const DownloadManager &) = delete;
+
         DownloadManager(DownloadManager &&) = delete;
+
         DownloadManager &operator=(DownloadManager &&) = delete;
+
         [[nodiscard]] TaskId add(std::string url, std::filesystem::path target_path);
+
         [[nodiscard]] bool pause(TaskId id);
+
         [[nodiscard]] bool resume(TaskId id);
+
         [[nodiscard]] bool cancel(TaskId id);
+
         [[nodiscard]] std::vector<TaskInfo> snapshot() const;
+
     private:
         enum class StopReason {
             Paused,
@@ -58,11 +68,18 @@ namespace dm::core {
         };
 
         void worker_loop(std::stop_token stop_token);
+
         std::optional<Job> take_next(std::stop_token stop_token);
-        TransferResult download_with_retries(Job& job, std::stop_token stop_token);
+
+        TransferResult download_with_retries(Job &job, std::stop_token stop_token);
+
         void begin_attempt(TaskId task_id, std::uint32_t attempt);
-        bool wait_before_retry();
-        void finish(const Job& job, TransferResult& transfer_result);
+
+        [[nodiscard]] bool wait_before_retry(TaskId task_id, const TransferResult &result, std::uint32_t next_attempt,
+                               std::stop_token stop_token);
+
+        void finish(const Job &job, TransferResult &transfer_result);
+
         Executor executor_;
         // mutable дозволяє блокувати м'ютекс усередині const-методу snapshot()
         mutable std::mutex mutex_;

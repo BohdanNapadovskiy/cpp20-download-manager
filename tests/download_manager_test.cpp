@@ -21,12 +21,15 @@
 namespace fs = std::filesystem;
 
 using dm::core::DownloadManager;
+using dm::core::RetryPolicy;
 using dm::core::TaskId;
 using dm::core::TaskInfo;
 using dm::core::TaskState;
+using dm::core::TransferError;
+using dm::core::TransferResult;
 using dm::test::FakeExecutor;
 
-// Behaviour checked by these tests (steps 2 and 3.4 of docs/IMPLEMENTATION_PLAN.md, README
+// Behaviour checked by these tests (steps 2, 3.4 and 3.5 of docs/IMPLEMENTATION_PLAN.md, README
 // "Поведінка", docs/Table.md). The executor is a fake: no network, the test decides when a
 // download ends, and a held download reacts to its stop token like download_once.
 //   * add() returns a new id; the task is visible in snapshot() with its URL and target path;
@@ -41,10 +44,43 @@ using dm::test::FakeExecutor;
 //   * snapshot() shows the progress reported by the executor (downloaded / total size, 0 = not
 //     known yet), separately for every task; a new attempt starts again from zero;
 //   * snapshot() shows the speed while downloading and 0 in every other state;
+//   * a temporary failure (network, HTTP 5xx/408/429) is retried up to max_attempts times
+//     with retry_delay() between attempts; meanwhile the task is Retrying and shows its
+//     attempt number and the last error; other failures are not retried; when the attempts
+//     run out the task is Failed with the last error; pause, cancel and the destructor
+//     interrupt the wait at once; resume gives the task all its attempts again;
 //   * the destructor stops and joins every worker, whether idle or busy; it interrupts running
 //     downloads instead of waiting for them, and starts no queued task.
 namespace {
     constexpr auto timeout = std::chrono::seconds(5);
+
+    using namespace std::chrono_literals;
+
+    // Most tests are about a single attempt: a failure becomes Failed at once. The retry tests
+    // pass their own policy.
+    RetryPolicy no_retries() {
+        return {.max_attempts = 1};
+    }
+
+    // Retries without noticeable waiting.
+    RetryPolicy quick_retries(std::uint32_t attempts) {
+        return {.max_attempts = attempts, .initial_delay = 1ms, .max_delay = 1ms};
+    }
+
+    // A wait between attempts far longer than any test timeout: whatever ends it within a test
+    // is an interruption, not the delay running out.
+    RetryPolicy endless_wait(std::uint32_t attempts = 5) {
+        return {.max_attempts = attempts, .initial_delay = 10min, .max_delay = 10min};
+    }
+
+    TransferResult network_error(const std::string& message = "fake: connection reset") {
+        return {.error = TransferError::Network, .error_message = message};
+    }
+
+    TransferResult http_error(int status) {
+        return {.error = TransferError::HttpStatus, .http_status_code = status,
+                .error_message = "fake: server responded with HTTP " + std::to_string(status)};
+    }
 
     std::string read_file(const fs::path& path) {
         std::ifstream in(path, std::ios::binary);
@@ -83,8 +119,8 @@ namespace {
             SandboxTest::TearDown();
         }
 
-        DownloadManager& start(std::size_t threads) {
-            manager_.emplace(fake_.executor(), threads);
+        DownloadManager& start(std::size_t threads, RetryPolicy policy = no_retries()) {
+            manager_.emplace(fake_.executor(), threads, policy);
             return *manager_;
         }
 
@@ -579,6 +615,168 @@ namespace {
         ASSERT_TRUE(manager_->pause(id));
         ASSERT_TRUE(wait_for_state(id, TaskState::Paused));
         EXPECT_EQ(find(id)->speed_bps, 0u) << "a paused download is not downloading at any speed";
+    }
+
+    // --- retries (3.5) ---------------------------------------------------------------------
+
+    TEST_F(DownloadManagerTest, FirstAttemptHasNumberOne) {
+        start(1, quick_retries(5));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        EXPECT_EQ(find(id)->attempt, 1u);
+        EXPECT_EQ(fake_.calls_for(url("a.bin")), 1u) << "a success is not repeated";
+    }
+
+    TEST_F(DownloadManagerTest, NetworkFailureIsRetriedUntilSuccess) {
+        fake_.fail_next(url("a.bin"), network_error());
+        fake_.fail_next(url("a.bin"), network_error());
+        start(1, quick_retries(5));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        EXPECT_EQ(fake_.calls_for(url("a.bin")), 3u) << "two failures, then a success";
+        EXPECT_EQ(find(id)->attempt, 3u);
+        EXPECT_EQ(read_file(target("a.bin")), FakeExecutor::content_for(url("a.bin")));
+        EXPECT_TRUE(find(id)->error_message.empty()) << "a completed task shows no old error";
+    }
+
+    TEST_F(DownloadManagerTest, ServerErrorsAreRetried) {
+        fake_.fail_next(url("a.bin"), http_error(503));
+        fake_.fail_next(url("a.bin"), http_error(429));
+        start(1, quick_retries(5));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        EXPECT_EQ(fake_.calls_for(url("a.bin")), 3u);
+    }
+
+    TEST_F(DownloadManagerTest, NotFoundIsNotRetried) {
+        start(1, quick_retries(5));
+        const TaskId id = add("404");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Failed));
+        EXPECT_EQ(fake_.calls_for(url("404")), 1u) << "another attempt cannot fix a 404";
+        EXPECT_EQ(find(id)->attempt, 1u);
+    }
+
+    TEST_F(DownloadManagerTest, TlsErrorIsNotRetried) {
+        fake_.fail_next(url("a.bin"), {.error = TransferError::Tls, .error_message = "fake: bad certificate"});
+        start(1, quick_retries(5));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Failed));
+        EXPECT_EQ(fake_.calls_for(url("a.bin")), 1u);
+    }
+
+    TEST_F(DownloadManagerTest, TaskFailsWhenAttemptsRunOut) {
+        start(1, quick_retries(3));
+        const TaskId id = add("fail");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Failed));
+        EXPECT_EQ(fake_.calls_for(url("fail")), 3u) << "max_attempts counts every attempt, the first too";
+        EXPECT_EQ(find(id)->attempt, 3u);
+        EXPECT_FALSE(find(id)->error_message.empty());
+    }
+
+    TEST_F(DownloadManagerTest, FailedTaskKeepsTheLastError) {
+        fake_.fail_next(url("a.bin"), network_error("fake: first error"));
+        fake_.fail_next(url("a.bin"), http_error(503));
+        start(1, quick_retries(2));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Failed));
+        const auto info = find(id);
+        EXPECT_EQ(info->error_message, "fake: server responded with HTTP 503");
+        EXPECT_EQ(info->http_status_code, 503);
+    }
+
+    TEST_F(DownloadManagerTest, TaskIsRetryingWhileWaitingForNextAttempt) {
+        start(1, endless_wait());
+        const TaskId id = add("fail");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Retrying));
+        const auto info = find(id);
+        EXPECT_EQ(info->attempt, 1u) << "the attempt that has just failed";
+        EXPECT_FALSE(info->error_message.empty()) << "the user sees why the task is retrying";
+        EXPECT_EQ(info->speed_bps, 0u);
+        EXPECT_EQ(fake_.calls_for(url("fail")), 1u) << "the next attempt waits for the delay";
+    }
+
+    TEST_F(DownloadManagerTest, NextAttemptWaitsForTheDelay) {
+        fake_.fail_next(url("a.bin"), network_error());
+        start(1, {.max_attempts = 2, .initial_delay = 300ms, .max_delay = 300ms});
+        const auto started = std::chrono::steady_clock::now();
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        EXPECT_GE(std::chrono::steady_clock::now() - started, 300ms);
+    }
+
+    TEST_F(DownloadManagerTest, RetryingTaskCanBePausedAtOnce) {
+        start(1, endless_wait());
+        const TaskId id = add("fail");
+        ASSERT_TRUE(wait_for_state(id, TaskState::Retrying));
+
+        EXPECT_TRUE(manager_->pause(id));
+        EXPECT_TRUE(wait_for_state(id, TaskState::Paused)) << "pause must not wait for the delay";
+        EXPECT_EQ(fake_.calls_for(url("fail")), 1u) << "a paused task makes no more attempts";
+    }
+
+    TEST_F(DownloadManagerTest, RetryingTaskCanBeCanceledAtOnce) {
+        start(1, endless_wait());
+        const TaskId id = add("fail");
+        ASSERT_TRUE(wait_for_state(id, TaskState::Retrying));
+
+        EXPECT_TRUE(manager_->cancel(id));
+        EXPECT_TRUE(wait_for_state(id, TaskState::Canceled)) << "cancel must not wait for the delay";
+        EXPECT_EQ(fake_.calls_for(url("fail")), 1u);
+    }
+
+    TEST_F(DownloadManagerTest, RetryingTaskCannotBeResumed) {
+        start(1, endless_wait());
+        const TaskId id = add("fail");
+        ASSERT_TRUE(wait_for_state(id, TaskState::Retrying));
+
+        EXPECT_FALSE(manager_->resume(id)) << "only a paused task can be resumed";
+        EXPECT_EQ(state(id), TaskState::Retrying);
+    }
+
+    TEST_F(DownloadManagerTest, ResumeGivesAllAttemptsAgain) {
+        start(1, endless_wait(2));
+        const TaskId id = add("fail");
+        ASSERT_TRUE(wait_for_state(id, TaskState::Retrying));
+        ASSERT_TRUE(manager_->pause(id));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Paused));
+
+        ASSERT_TRUE(manager_->resume(id));
+        // Without the reset this second call would be attempt 2 of 2 and the task would fail.
+        ASSERT_TRUE(wait_until(id, [this](const TaskInfo& info) {
+            return fake_.calls_for(url("fail")) == 2 &&
+                   (info.state == TaskState::Retrying || info.state == TaskState::Failed);
+        }));
+        const auto info = find(id);
+        EXPECT_EQ(info->state, TaskState::Retrying) << "a resumed task starts its attempts again";
+        EXPECT_EQ(info->attempt, 1u);
+    }
+
+    TEST_F(DownloadManagerTest, QueuedTaskStartsWhileAnotherIsRetrying) {
+        start(2, endless_wait());
+        const TaskId retrying = add("fail");
+        ASSERT_TRUE(wait_for_state(retrying, TaskState::Retrying));
+
+        // The waiting worker must not swallow the wake-up meant for the idle one.
+        const TaskId next = add("a.bin");
+        EXPECT_TRUE(wait_for_state(next, TaskState::Completed)) << "the second worker is free";
+    }
+
+    TEST_F(DownloadManagerTest, DestructorInterruptsTheWaitBetweenAttempts) {
+        start(1, endless_wait());
+        const TaskId id = add("fail");
+        ASSERT_TRUE(wait_for_state(id, TaskState::Retrying));
+
+        EXPECT_TRUE(finishes_in_time([this] { manager_.reset(); }))
+                << "closing the program must not wait for the delay";
     }
 
     // --- shutdown --------------------------------------------------------------------------

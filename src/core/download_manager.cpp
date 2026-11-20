@@ -131,10 +131,6 @@ namespace dm::core {
                 continue;
             }
             it->second.info.state = TaskState::Downloading;
-            it->second.info.downloaded_bytes = 0;
-            it->second.info.total_bytes = 0;
-            it->second.info.speed_bps = 0;
-            it->second.speed_meter.start(SpeedMeter::Clock::now());
             std::filesystem::path part_path = it->second.info.target_path;
             part_path += ".part";
             return Job{
@@ -169,17 +165,55 @@ namespace dm::core {
             std::stop_callback link_to_worker(stop_token, [&job] {
                 job.task_stop.request_stop();
             });
-            result = executor_(request);
+            std::uint32_t attempt = 1;
+            while (true) {
+                begin_attempt(job.id, attempt);
+                result = executor_(request);
+                if (!should_retry(result) || result.ok() || attempt >= retry_policy_.max_attempts) {
+                    break;
+                }
+                if (!wait_before_retry(job.id, result, attempt + 1, job.task_stop.get_token())) {
+                    result.error = TransferError::Aborted;
+                    result.error_message = "wait_before_retry() aborted: stop requested";
+                    result.http_status_code = 0;
+                    break;
+                }
+                attempt++;
+            }
         }
         return result;
     }
 
     void DownloadManager::begin_attempt(TaskId task_id, std::uint32_t attempt) {
-        std::unique_lock lock(mutex_);
+        std::lock_guard lock(mutex_);
+        auto task_it = tasks_.find(task_id);
+        if (task_it != tasks_.end()) {
+            task_it->second.info.attempt = attempt;
+            task_it->second.info.state = TaskState::Downloading;
+            task_it->second.info.downloaded_bytes = 0;
+            task_it->second.info.total_bytes = 0;
+            task_it->second.info.speed_bps = 0;
+            task_it->second.speed_meter.start(SpeedMeter::Clock::now());
+        }
     }
 
-    bool DownloadManager::wait_before_retry() {
-        return false;
+    bool DownloadManager::wait_before_retry(TaskId task_id, const TransferResult &result, std::uint32_t next_attempt,
+                                            std::stop_token stop_token) {
+        std::unique_lock lock(mutex_);
+        auto task_it = tasks_.find(task_id);
+        if (task_it == tasks_.end()) {
+            return false;
+        }
+        task_it->second.info.state = TaskState::Retrying;
+        task_it->second.info.error_message = result.error_message;
+        task_it->second.info.http_status_code = result.http_status_code;
+        task_it->second.info.speed_bps = 0;
+        auto delay = retry_delay(retry_policy_, next_attempt);
+        std::condition_variable_any retry_wait;
+        retry_wait.wait_for(lock, stop_token, delay, []() {
+            return false;
+        });
+        return !stop_token.stop_requested();
     }
 
     void DownloadManager::finish(const Job &job, TransferResult &transfer_result) {
