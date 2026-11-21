@@ -37,7 +37,8 @@ using dm::test::FakeExecutor;
 //     to target_path and the task becomes Completed; on failure it becomes Failed and keeps
 //     the error message and HTTP status;
 //   * never more downloads at once than worker threads, and every worker is used;
-//   * pause/cancel work on queued tasks; resume puts a paused task at the END of the queue;
+//   * pause/cancel work on queued tasks; resume puts a paused or failed task at the END of the
+//     queue with all its attempts and without the old error message;
 //   * a running download can be paused (-> Paused, .part kept, resume downloads it again) or
 //     canceled (-> Canceled, .part deleted); other running downloads are not affected;
 //   * a forbidden action (unknown id, wrong state) returns false and changes nothing;
@@ -400,6 +401,73 @@ namespace {
         EXPECT_FALSE(manager_->resume(completed));
         EXPECT_FALSE(manager_->cancel(completed));
         EXPECT_EQ(state(completed), TaskState::Completed);
+    }
+
+    // --- resume of a failed task ------------------------------------------------------------
+
+    TEST_F(DownloadManagerTest, FailedTaskCanBeResumedAndCompleted) {
+        fake_.fail_next(url("a.bin"), network_error());
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(wait_for_state(id, TaskState::Failed));
+
+        EXPECT_TRUE(manager_->resume(id)) << "the user may retry a failed task by hand";
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        EXPECT_EQ(fake_.calls_for(url("a.bin")), 2u);
+        EXPECT_EQ(read_file(target("a.bin")), FakeExecutor::content_for(url("a.bin")));
+    }
+
+    TEST_F(DownloadManagerTest, ResumedFailedTaskForgetsTheOldError) {
+        fake_.fail_next(url("a.bin"), http_error(503));
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(wait_for_state(id, TaskState::Failed));
+        ASSERT_EQ(find(id)->http_status_code, 503);
+
+        fake_.block();   // keep the new attempt running, so its result cannot overwrite the fields
+        ASSERT_TRUE(manager_->resume(id));
+        const auto info = find(id);
+        EXPECT_TRUE(info->error_message.empty()) << "a queued task must not show the last error";
+        EXPECT_EQ(info->http_status_code, 0);
+    }
+
+    TEST_F(DownloadManagerTest, ResumedPausedTaskForgetsTheStopMessage) {
+        fake_.block();
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+        ASSERT_TRUE(manager_->pause(id));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Paused));
+        ASSERT_FALSE(find(id)->error_message.empty()) << "precondition: the abort left a message";
+
+        ASSERT_TRUE(manager_->resume(id));
+        EXPECT_TRUE(find(id)->error_message.empty());
+    }
+
+    TEST_F(DownloadManagerTest, ResumedFailedTaskGetsAllAttemptsAgain) {
+        start(1, quick_retries(2));
+        const TaskId id = add("fail");
+        ASSERT_TRUE(wait_for_state(id, TaskState::Failed));
+        ASSERT_EQ(fake_.calls_for(url("fail")), 2u);
+
+        ASSERT_TRUE(manager_->resume(id));
+        ASSERT_TRUE(wait_until(id, [this](const TaskInfo& info) {
+            return info.state == TaskState::Failed && fake_.calls_for(url("fail")) >= 3;
+        }));
+        EXPECT_EQ(fake_.calls_for(url("fail")), 4u) << "two more attempts after the resume";
+        EXPECT_EQ(find(id)->attempt, 2u);
+    }
+
+    TEST_F(DownloadManagerTest, CanceledTaskCannotBeResumed) {
+        fake_.block();
+        start(1);
+        add("a.bin");
+        const TaskId canceled = add("b.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+        ASSERT_TRUE(manager_->cancel(canceled));
+
+        EXPECT_FALSE(manager_->resume(canceled)) << "Canceled is a final state";
+        EXPECT_EQ(state(canceled), TaskState::Canceled);
     }
 
     // --- pause / cancel a running download (3.4) ---------------------------------------------

@@ -58,11 +58,18 @@ namespace dm::core {
         {
             std::lock_guard lock(mutex_);
             auto it = tasks_.find(id);
-            if (it == tasks_.end() || it->second.info.state != TaskState::Paused) {
+            if (it == tasks_.end()) {
+                return false;
+            }
+            const bool resumable = it->second.info.state == TaskState::Paused
+                                   || it->second.info.state == TaskState::Failed;
+            if (!resumable) {
                 return false;
             }
             it->second.stop = std::stop_source{};
             it->second.info.attempt = 0;
+            it->second.info.error_message.clear();
+            it->second.info.http_status_code = 0;
             it->second.stop_reason = StopReason::None;
             it->second.info.state = TaskState::Queued;
             queue_.emplace_back(id);
