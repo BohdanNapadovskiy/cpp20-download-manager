@@ -15,6 +15,7 @@ namespace dm::core {
             case TransferError::DiskWrite:  *os << "DiskWrite"; return;
             case TransferError::HttpStatus: *os << "HttpStatus"; return;
             case TransferError::Aborted:    *os << "Aborted"; return;
+            case TransferError::ResumeRejected: *os << "ResumeRejected"; return;
         }
         *os << "TransferError(" << static_cast<int>(error) << ")";
     }

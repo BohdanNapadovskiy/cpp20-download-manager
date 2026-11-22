@@ -15,7 +15,8 @@ using dm::core::TransferError;
 using dm::core::TransferResult;
 
 // Behaviour checked by these tests (step 3.5 of docs/IMPLEMENTATION_PLAN.md, README "Поведінка"):
-//   * should_retry: a temporary failure is worth another attempt (network, HTTP 5xx, 408, 429);
+//   * should_retry: a temporary failure is worth another attempt (network, HTTP 5xx, 408, 429,
+//     a refused resume);
 //     a failure that another attempt cannot fix is not (other 4xx, TLS, disk, abort, success);
 //   * retry_delay: `attempt` is the attempt about to start (from 1); 0 before the first,
 //     initial_delay before the second, doubling after that, never above max_delay; large
@@ -31,6 +32,11 @@ namespace {
     TEST(ShouldRetryTest, NetworkErrorIsRetried) {
         EXPECT_TRUE(should_retry({.error = TransferError::Network}))
                 << "a dropped connection, a timeout or a stalled download may work next time";
+    }
+
+    TEST(ShouldRetryTest, ResumeRejectedIsRetried) {
+        EXPECT_TRUE(should_retry({.error = TransferError::ResumeRejected}))
+                << "the .part is gone, so the next attempt downloads from zero";
     }
 
     TEST(ShouldRetryTest, ServerErrorsAreRetried) {

@@ -12,8 +12,11 @@
 
 namespace dm::core {
     namespace {
+        struct FileWriteState;
+
         struct ProgressContext {
             const std::stop_token *stop_token = nullptr;
+            const FileWriteState *state = nullptr;
             const std::function<void(std::uint64_t, std::uint64_t)> *on_progress = nullptr;
         };
 
@@ -25,6 +28,7 @@ namespace dm::core {
 
         struct FileWriteState {
             std::filesystem::path part_path;
+            std::uint64_t resume_from = 0;
             std::ofstream stream{};
             std::uintmax_t bytes_transferred = 0;
             int http_status = 0;
@@ -89,7 +93,11 @@ namespace dm::core {
                     return bytes_to_write;
                 }
                 if (!s->stream.is_open()) {
-                    s->stream.open(s->part_path, std::ios::out | std::ios::binary);
+                    std::ios::openmode mode = std::ios::out | std::ios::binary;
+                    if (s->http_status == 206) {
+                        mode |= std::ios::app;
+                    }
+                    s->stream.open(s->part_path, mode);
                     if (!s->stream) {
                         s->failure = WriteFailure::Open;
                         return 0;
@@ -124,8 +132,14 @@ namespace dm::core {
             }
             try {
                 if (ctx->on_progress != nullptr && *ctx->on_progress) {
-                    const auto downloaded = dlnow > 0 ? static_cast<std::uint64_t>(dlnow) : std::uint64_t{0};
-                    const auto total = dltotal > 0 ? static_cast<std::uint64_t>(dltotal) : std::uint64_t{0};
+                    const std::uint64_t base = (ctx->state != nullptr && ctx->state->http_status == 206)
+                                                   ? ctx->state->resume_from
+                                                   : 0;
+                    const auto current_dl = dlnow > 0 ? static_cast<std::uint64_t>(dlnow) : std::uint64_t{0};
+                    const std::uint64_t downloaded = base + current_dl;
+                    const std::uint64_t total = dltotal > 0
+                                                    ? base + static_cast<std::uint64_t>(dltotal)
+                                                    : std::uint64_t{0};
                     (*ctx->on_progress)(downloaded, total);
                 }
             } catch (...) {
@@ -169,8 +183,15 @@ namespace dm::core {
         long response_code = 0;
         const long connect_timeout_s = static_cast<long>(request.connect_timeout.count());
         const long low_speed_time = static_cast<long>(request.low_speed_time.count());
-        FileWriteState state{.part_path = request.part_path};
-        ProgressContext progress_context{.stop_token = &request.stop_token, .on_progress = &request.on_progress};
+        std::error_code size_ec;
+        std::uint64_t resume_from = std::filesystem::file_size(request.part_path, size_ec);
+        if (size_ec) {
+            resume_from = 0;
+        }
+        FileWriteState state{.part_path = request.part_path, .resume_from = resume_from};
+        ProgressContext progress_context{
+            .stop_token = &request.stop_token, .state = &state, .on_progress = &request.on_progress
+        };
         curl_easy_setopt(handle.get(), CURLOPT_URL, request.url.c_str());
         curl_easy_setopt(handle.get(), CURLOPT_ERRORBUFFER, error_buffer);
         curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, write_callback);
@@ -188,6 +209,8 @@ namespace dm::core {
         curl_easy_setopt(handle.get(), CURLOPT_XFERINFODATA, &progress_context);
         curl_easy_setopt(handle.get(), CURLOPT_LOW_SPEED_LIMIT, request.low_speed_limit_bps);
         curl_easy_setopt(handle.get(), CURLOPT_LOW_SPEED_TIME, low_speed_time);
+        auto resume_offset = static_cast<curl_off_t>(state.resume_from);
+        curl_easy_setopt(handle.get(), CURLOPT_RESUME_FROM_LARGE, resume_offset);
         const CURLcode code = curl_easy_perform(handle.get());
         auto info_code = curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response_code);
         if (info_code != CURLE_OK) {
@@ -211,6 +234,11 @@ namespace dm::core {
         } else if (code == CURLE_ABORTED_BY_CALLBACK) {
             error = TransferError::Aborted;
             error_msg = "download_once() aborted: stop requested";
+        } else if (code == CURLE_RANGE_ERROR || (code == CURLE_OK && http_status == 416 && state.resume_from > 0) ) {
+            error = TransferError::ResumeRejected;
+            error_msg = "download_once() failed: server refused to resume from byte: " + std::to_string(state.resume_from);
+            std::error_code remove_ec;
+            std::filesystem::remove(state.part_path, remove_ec);
         } else if (code != CURLE_OK) {
             error_msg = curl_error_message(error_buffer, code);
             error = TransferError::Network;

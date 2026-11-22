@@ -10,7 +10,8 @@ namespace dm::core {
         Tls,
         DiskWrite,
         HttpStatus,
-        Aborted
+        Aborted,
+        ResumeRejected
     };
 
     using TaskId = std::uint64_t;

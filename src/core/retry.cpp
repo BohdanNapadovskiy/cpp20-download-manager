@@ -6,6 +6,9 @@ namespace dm::core {
         if (result.error == TransferError::Network) {
             return true;
         }
+        if (result.error == TransferError::ResumeRejected) {
+            return true;
+        }
         if (result.error == TransferError::HttpStatus) {
             if (result.http_status_code >= 500 && result.http_status_code <= 599) {
                 return true;

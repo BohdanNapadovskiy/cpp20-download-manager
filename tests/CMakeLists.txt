@@ -32,6 +32,7 @@ add_executable(dm_tests
         download_once_test.cpp
         download_once_abort_test.cpp
         download_once_progress_test.cpp
+        download_once_resume_test.cpp
         speed_meter_test.cpp
         retry_test.cpp
         download_manager_test.cpp
