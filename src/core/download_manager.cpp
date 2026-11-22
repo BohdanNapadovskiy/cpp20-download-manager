@@ -200,7 +200,7 @@ namespace dm::core {
             task_it->second.info.downloaded_bytes = 0;
             task_it->second.info.total_bytes = 0;
             task_it->second.info.speed_bps = 0;
-            task_it->second.speed_meter.start(SpeedMeter::Clock::now());
+            task_it->second.speed_meter = SpeedMeter{};
         }
     }
 

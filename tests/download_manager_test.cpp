@@ -44,7 +44,8 @@ using dm::test::FakeExecutor;
 //   * a forbidden action (unknown id, wrong state) returns false and changes nothing;
 //   * snapshot() shows the progress reported by the executor (downloaded / total size, 0 = not
 //     known yet), separately for every task; a new attempt starts again from zero;
-//   * snapshot() shows the speed while downloading and 0 in every other state;
+//   * snapshot() shows the speed while downloading and 0 in every other state; a resumed
+//     download does not count the bytes already in its .part as speed;
 //   * a temporary failure (network, HTTP 5xx/408/429) is retried up to max_attempts times
 //     with retry_delay() between attempts; meanwhile the task is Retrying and shows its
 //     attempt number and the last error; other failures are not retried; when the attempts
@@ -675,6 +676,30 @@ namespace {
         fake_.release();
         ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
         EXPECT_EQ(find(id)->speed_bps, 0u) << "a finished download is not downloading at any speed";
+    }
+
+    // A resumed download reports the bytes already in the .part from its first report on
+    // (download_once counts the whole file). Those bytes did not arrive during this attempt,
+    // so they must not show up as speed: the meter starts from the first report of the attempt.
+    TEST_F(DownloadManagerTest, SpeedAfterResumeCountsOnlyNewBytes) {
+        constexpr std::size_t already_on_disk = 400 * 1024;
+        constexpr std::size_t file_total = 1024 * 1024;
+        constexpr std::size_t new_bytes = 10 * 1024;
+        fake_.block();
+        fake_.set_report_partial(false);   // the first report below is the attempt's first one
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_held(1)) << "report_held() reaches only calls already held";
+
+        fake_.report_held(already_on_disk, file_total);
+        ASSERT_TRUE(wait_until(id, [](const TaskInfo& info) { return info.downloaded_bytes == already_on_disk; }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // one full speed window
+        fake_.report_held(already_on_disk + new_bytes, file_total);
+
+        ASSERT_TRUE(wait_until(id, [](const TaskInfo& info) { return info.speed_bps > 0; }));
+        EXPECT_LE(find(id)->speed_bps, new_bytes)
+                << "only " << new_bytes << " bytes arrived in more than a second; the "
+                << already_on_disk << " bytes from the .part are not speed";
     }
 
     TEST_F(DownloadManagerTest, PausedTaskHasZeroSpeed) {

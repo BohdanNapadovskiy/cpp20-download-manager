@@ -23,8 +23,8 @@ namespace dm::test {
     //   * a call reports progress through request.on_progress like download_once: a held call
     //     reports (partial size, full size), a successful call reports (full size, full size),
     //     where full size is content_for(url).size();
-    //   * report_held(n) sends one more progress report from every held call;
-    //   * wait_started(n) waits until n calls have begun;
+    //   * report_held(n[, total]) sends one more progress report from every held call;
+    //   * wait_started(n) waits until n calls have begun, wait_held(n) until n are held in block();
     //   * the outcome depends on the URL: ".../fail" -> Network error, ".../404" -> HttpStatus,
     //     anything else -> 200 and the file content "content of <url>" written to part_path;
     //   * fail_next(url, result) makes the next call for that URL return `result` instead, once;
@@ -63,13 +63,19 @@ namespace dm::test {
         // as if more data had arrived. Call it only while the calls are held: the requests
         // belong to the running calls.
         void report_held(std::size_t downloaded) {
+            report_held(downloaded, 0);
+        }
+
+        // The same with an explicit total, e.g. to imitate a download resumed from a .part file:
+        // its first report already counts the bytes that were on disk. total 0 = full size.
+        void report_held(std::size_t downloaded, std::size_t total) {
             std::vector<const core::TransferRequest*> held;
             {
                 std::scoped_lock lock(mutex_);
                 held = held_;
             }
             for (const core::TransferRequest* request : held) {
-                report_progress(*request, downloaded, content_for(request->url).size());
+                report_progress(*request, downloaded, total != 0 ? total : content_for(request->url).size());
             }
         }
 
@@ -78,6 +84,13 @@ namespace dm::test {
         void set_report_partial(bool report) {
             std::scoped_lock lock(mutex_);
             report_partial_ = report;
+        }
+
+        // False if fewer than `count` calls are held in block() within the timeout. Stronger than
+        // wait_started: a held call is ready for report_held().
+        bool wait_held(std::size_t count, std::chrono::seconds timeout = std::chrono::seconds(5)) {
+            std::unique_lock lock(mutex_);
+            return cv_.wait_for(lock, timeout, [&] { return held_.size() >= count; });
         }
 
         // False if fewer than `count` calls started within the timeout.
@@ -136,6 +149,7 @@ namespace dm::test {
                 }
                 lock.lock();
                 held_.push_back(&request);
+                cv_.notify_all();   // wake wait_held()
                 // false: the stop token was stopped before release() -> interrupted download
                 const bool released = cv_.wait(lock, request.stop_token, [&] { return !blocked_; });
                 std::erase(held_, &request);
