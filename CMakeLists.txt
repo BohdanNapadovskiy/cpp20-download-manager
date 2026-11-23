@@ -39,6 +39,13 @@ FetchContent_Declare(
         URL_HASH SHA256=85477fe11408471285f38a601e7c6f53470d13be9a5a316919b071ad02e68213
 )
 
+FetchContent_Declare(
+        nlohmann_json
+        URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
+)
+
 set(CURL_USE_SCHANNEL ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_CURL_EXE OFF CACHE BOOL "" FORCE)
@@ -57,13 +64,16 @@ set(CURL_DISABLE_TELNET ON CACHE BOOL "" FORCE)
 set(BUILD_LIBCURL_DOCS OFF CACHE BOOL "" FORCE)
 set(BUILD_MISC_DOCS OFF CACHE BOOL "" FORCE)
 set(ENABLE_CURL_MANUAL OFF CACHE BOOL "" FORCE)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+set(JSON_Install OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(curl)
+FetchContent_MakeAvailable(curl nlohmann_json)
 
 add_library(dm_core STATIC ${DM_CORE_SOURCES})
 target_include_directories(dm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dm_core PRIVATE dm_warnings)
 target_link_libraries(dm_core PRIVATE CURL::libcurl)
+target_link_libraries(dm_core PRIVATE nlohmann_json::nlohmann_json)
 
 set(DM_CLI_SOURCES
         src/cli/commands.cpp

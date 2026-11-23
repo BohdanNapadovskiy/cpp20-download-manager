@@ -35,6 +35,7 @@ add_executable(dm_tests
         download_once_resume_test.cpp
         speed_meter_test.cpp
         retry_test.cpp
+        state_store_test.cpp
         download_manager_test.cpp
 )
 target_link_libraries(dm_tests PRIVATE dm_warnings)
