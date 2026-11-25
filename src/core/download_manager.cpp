@@ -25,7 +25,7 @@ namespace dm::core {
 
     TaskId DownloadManager::add(std::string url, std::filesystem::path target_path) {
         TaskId id{};
-         StateChange state_change;
+        StateChange state_change;
         {
             std::lock_guard lock(mutex_);
             id = next_id_++;
@@ -247,6 +247,47 @@ namespace dm::core {
         return !stop_token.stop_requested();
     }
 
+    std::size_t DownloadManager::restore(std::vector<TaskInfo> tasks) {
+        TaskId max_id = 0;
+        std::size_t count = 0;
+        {
+            std::lock_guard lock(mutex_);
+            for (auto &task: tasks) {
+                if (tasks_.contains(task.id)) {
+                    continue;
+                }
+                if (task.state == TaskState::Canceled) {
+                    continue;
+                }
+                task.speed_bps = 0;
+                task.attempt = 0;
+                std::error_code size_ec;
+                std::filesystem::path part_path = task.target_path;
+                part_path += ".part";
+                if (task.state != TaskState::Completed) {
+                    task.downloaded_bytes = std::filesystem::file_size(part_path, size_ec);
+                    if (size_ec) {
+                        task.downloaded_bytes = 0;
+                    }
+                } else {
+                    task.downloaded_bytes = task.total_bytes;
+                }
+                if (task.state == TaskState::Downloading || task.state == TaskState::Retrying) {
+                    task.state = TaskState::Queued;
+                }
+                if (task.state == TaskState::Queued) {
+                    queue_.push_back(task.id);
+                }
+                max_id = std::max(max_id, task.id);
+                tasks_.emplace(task.id, std::move(task));
+                ++count;
+            }
+            next_id_ = std::max(next_id_, max_id + 1);
+        }
+        cv_.notify_all();
+        return count;
+    }
+
     void DownloadManager::finish(const Job &job, TransferResult &transfer_result) {
         std::error_code ec;
         if (transfer_result.ok()) {
@@ -300,7 +341,6 @@ namespace dm::core {
     }
 
 
-
     std::vector<TaskInfo> DownloadManager::snapshot_locked() const {
         std::vector<TaskInfo> result;
         result.reserve(tasks_.size());
@@ -311,7 +351,7 @@ namespace dm::core {
         return result;
     }
 
-    void DownloadManager::notify(const StateChange& change) {
+    void DownloadManager::notify(const StateChange &change) {
         if (!state_listener_) {
             return;
         }

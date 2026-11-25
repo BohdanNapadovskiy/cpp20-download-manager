@@ -58,6 +58,12 @@ using dm::test::FakeExecutor;
 //     and final states; a refused action reports nothing; a pause or cancel of a running task
 //     is reported when the worker reaches the new state; the last snapshot the listener gets
 //     is the final state; the listener may call snapshot() and may throw;
+//   * restore() puts back the tasks loaded from state.json with their ids: queued ones go to the
+//     queue in the given order, paused, failed and completed ones only to the list; Downloading
+//     and Retrying come back as Queued, Canceled is skipped; downloaded bytes come from the
+//     .part (a completed task shows its full size); speed and attempt start from 0; the next
+//     add() gets an id after the largest restored one; a task whose id exists is not restored
+//     again; restore() returns how many tasks it added;
 //   * the destructor stops and joins every worker, whether idle or busy; it interrupts running
 //     downloads instead of waiting for them, and starts no queued task.
 namespace {
@@ -264,6 +270,11 @@ namespace {
 
         // A manager without workers: tasks stay where add/pause/resume/cancel put them, so the
         // reports of these actions can be checked one by one.
+        // A task as load_state() gives it back: what restore() receives.
+        TaskInfo saved(TaskId id, TaskState state, const std::string& name) const {
+            return TaskInfo{.id = id, .url = url(name), .state = state, .target_path = target(name)};
+        }
+
         DownloadManager& start_without_workers() {
             return start(0, no_retries(), recorder_.listener());
         }
@@ -1133,6 +1144,161 @@ namespace {
         const TaskId id = add("a.bin");
         EXPECT_TRUE(wait_for_state(id, TaskState::Completed)) << "the worker survives the listener's exception";
         EXPECT_TRUE(fs::exists(target("a.bin")));
+    }
+
+    // --- restore (step 4, loading the state) ----------------------------------------------
+
+    TEST_F(DownloadManagerTest, RestoredTasksKeepTheirIdsAndStates) {
+        start(0);
+        const std::size_t restored = manager_->restore({saved(7, TaskState::Paused, "a.bin"),
+                                                        saved(9, TaskState::Completed, "b.bin"),
+                                                        saved(42, TaskState::Failed, "c.bin")});
+
+        EXPECT_EQ(restored, 3u);
+        const auto tasks = manager_->snapshot();
+        ASSERT_EQ(tasks.size(), 3u);
+        EXPECT_EQ(tasks[0].id, 7u) << "the user refers to tasks by id, so ids survive a restart";
+        EXPECT_EQ(tasks[0].state, TaskState::Paused);
+        EXPECT_EQ(tasks[0].url, url("a.bin"));
+        EXPECT_EQ(tasks[0].target_path, target("a.bin"));
+        EXPECT_EQ(tasks[1].id, 9u);
+        EXPECT_EQ(tasks[1].state, TaskState::Completed);
+        EXPECT_EQ(tasks[2].id, 42u);
+        EXPECT_EQ(tasks[2].state, TaskState::Failed);
+    }
+
+    TEST_F(DownloadManagerTest, NextAddGetsAnIdAfterTheLargestRestored) {
+        start(0);
+        ASSERT_EQ(manager_->restore({saved(7, TaskState::Paused, "a.bin"), saved(42, TaskState::Failed, "b.bin")}), 2u);
+
+        const TaskId id = add("c.bin");
+
+        EXPECT_EQ(id, 43u);
+        EXPECT_EQ(manager_->snapshot().size(), 3u) << "the new task must not be lost on a clashing id";
+    }
+
+    TEST_F(DownloadManagerTest, RestoredQueuedTasksAreDownloadedInTheirOrder) {
+        start(1);
+        ASSERT_EQ(manager_->restore({saved(1, TaskState::Queued, "a.bin"), saved(2, TaskState::Queued, "b.bin"),
+                                     saved(3, TaskState::Queued, "c.bin")}), 3u);
+
+        for (const TaskId id : {1u, 2u, 3u}) {
+            ASSERT_TRUE(wait_for_state(id, TaskState::Completed)) << "task " << id;
+        }
+        const auto requests = fake_.requests();
+        ASSERT_EQ(requests.size(), 3u);
+        EXPECT_EQ(requests[0].url, url("a.bin"));
+        EXPECT_EQ(requests[1].url, url("b.bin"));
+        EXPECT_EQ(requests[2].url, url("c.bin"));
+    }
+
+    TEST_F(DownloadManagerTest, RestoredQueuedTaskWakesAWorker) {
+        start(2);   // the workers are already waiting when restore() fills the queue
+
+        ASSERT_EQ(manager_->restore({saved(1, TaskState::Queued, "a.bin"), saved(2, TaskState::Queued, "b.bin")}), 2u);
+
+        EXPECT_TRUE(wait_for_state(1, TaskState::Completed));
+        EXPECT_TRUE(wait_for_state(2, TaskState::Completed));
+    }
+
+    TEST_F(DownloadManagerTest, RestoredPausedTaskWaitsUntilResumed) {
+        start(1);
+        ASSERT_EQ(manager_->restore({saved(1, TaskState::Paused, "a.bin"), saved(2, TaskState::Queued, "b.bin")}), 2u);
+        ASSERT_TRUE(wait_for_state(2, TaskState::Completed));
+        EXPECT_EQ(fake_.calls_for(url("a.bin")), 0u) << "a paused task is not downloaded on its own";
+
+        ASSERT_TRUE(manager_->resume(1));
+        EXPECT_TRUE(wait_for_state(1, TaskState::Completed));
+    }
+
+    TEST_F(DownloadManagerTest, RestoredFailedTaskCanBeResumed) {
+        start(1);
+        TaskInfo failed = saved(1, TaskState::Failed, "a.bin");
+        failed.http_status_code = 503;
+        failed.error_message = "download_once() failed: server responded with HTTP 503";
+        ASSERT_EQ(manager_->restore({failed}), 1u);
+        EXPECT_EQ(find(1)->error_message, failed.error_message) << "the reason survives the restart";
+
+        ASSERT_TRUE(manager_->resume(1));
+        EXPECT_TRUE(wait_for_state(1, TaskState::Completed));
+    }
+
+    TEST_F(DownloadManagerTest, DownloadingAndRetryingAreRestoredAsQueued) {
+        start(0);
+        ASSERT_EQ(manager_->restore({saved(1, TaskState::Downloading, "a.bin"),
+                                     saved(2, TaskState::Retrying, "b.bin")}), 2u);
+
+        EXPECT_EQ(state(1), TaskState::Queued) << "no worker is running it after a restart";
+        EXPECT_EQ(state(2), TaskState::Queued);
+        EXPECT_FALSE(manager_->resume(1)) << "a queued task is already waiting for a worker";
+    }
+
+    TEST_F(DownloadManagerTest, RestoredDownloadingTaskIsDownloadedAgain) {
+        start(1);
+        ASSERT_EQ(manager_->restore({saved(1, TaskState::Downloading, "a.bin")}), 1u);
+
+        EXPECT_TRUE(wait_for_state(1, TaskState::Completed)) << "it went back to the queue";
+    }
+
+    TEST_F(DownloadManagerTest, CanceledTaskIsNotRestored) {
+        start(0);
+        const std::size_t restored = manager_->restore({saved(1, TaskState::Paused, "a.bin"),
+                                                        saved(2, TaskState::Canceled, "b.bin")});
+
+        EXPECT_EQ(restored, 1u);
+        ASSERT_EQ(manager_->snapshot().size(), 1u);
+        EXPECT_EQ(manager_->snapshot()[0].id, 1u);
+    }
+
+    TEST_F(DownloadManagerTest, RestoredProgressComesFromThePartFile) {
+        start(0);
+        std::ofstream(target("a.bin").string() + ".part", std::ios::binary) << std::string(400, 'x');
+        TaskInfo with_part = saved(1, TaskState::Paused, "a.bin");
+        with_part.total_bytes = 1000;
+        with_part.downloaded_bytes = 999;   // what the file says does not count: the .part decides
+        TaskInfo without_part = saved(2, TaskState::Paused, "b.bin");
+        without_part.total_bytes = 1000;
+        TaskInfo completed = saved(3, TaskState::Completed, "c.bin");
+        completed.total_bytes = 1000;
+
+        ASSERT_EQ(manager_->restore({with_part, without_part, completed}), 3u);
+
+        EXPECT_EQ(find(1)->downloaded_bytes, 400u) << "the size of the .part on disk";
+        EXPECT_EQ(find(1)->total_bytes, 1000u);
+        EXPECT_EQ(find(2)->downloaded_bytes, 0u) << "no .part, nothing downloaded yet";
+        EXPECT_EQ(find(3)->downloaded_bytes, 1000u) << "a completed task shows N of N";
+    }
+
+    TEST_F(DownloadManagerTest, RestoredTaskStartsWithoutSpeedOrAttempts) {
+        start(0);
+        TaskInfo info = saved(1, TaskState::Paused, "a.bin");
+        info.speed_bps = 5000;
+        info.attempt = 3;
+
+        ASSERT_EQ(manager_->restore({info}), 1u);
+
+        EXPECT_EQ(find(1)->speed_bps, 0u);
+        EXPECT_EQ(find(1)->attempt, 0u);
+    }
+
+    TEST_F(DownloadManagerTest, RestoringTheSameTasksAgainAddsNothing) {
+        start(0);
+        const std::vector<TaskInfo> tasks{saved(1, TaskState::Queued, "a.bin"), saved(2, TaskState::Paused, "b.bin")};
+        ASSERT_EQ(manager_->restore(tasks), 2u);
+
+        EXPECT_EQ(manager_->restore(tasks), 0u) << "a task whose id exists is not restored twice";
+        EXPECT_EQ(manager_->snapshot().size(), 2u);
+    }
+
+    TEST_F(DownloadManagerTest, RestoredQueuedTaskIsQueuedOnce) {
+        start(1);
+        const std::vector<TaskInfo> tasks{saved(1, TaskState::Queued, "a.bin")};
+        ASSERT_EQ(manager_->restore(tasks), 1u);
+        (void)manager_->restore(tasks);
+
+        ASSERT_TRUE(wait_for_state(1, TaskState::Completed));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));   // a second queue entry would start now
+        EXPECT_EQ(fake_.calls_for(url("a.bin")), 1u) << "a skipped task must not be put in the queue again";
     }
 
     // --- shutdown --------------------------------------------------------------------------

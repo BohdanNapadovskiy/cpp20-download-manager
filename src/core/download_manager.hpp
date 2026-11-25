@@ -47,6 +47,8 @@ namespace dm::core {
 
         [[nodiscard]] std::vector<TaskInfo> snapshot() const;
 
+        [[nodiscard]] std::size_t restore(std::vector<TaskInfo> tasks);
+
     private:
         enum class StopReason {
             Paused,
