@@ -13,7 +13,9 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,6 +53,11 @@ using dm::test::FakeExecutor;
 //     attempt number and the last error; other failures are not retried; when the attempts
 //     run out the task is Failed with the last error; pause, cancel and the destructor
 //     interrupt the wait at once; resume gives the task all its attempts again;
+//   * the state listener gets a full snapshot, sorted by id, after every change of a task's
+//     state: add, pause/resume/cancel of a waiting task, and the worker's Downloading, Retrying
+//     and final states; a refused action reports nothing; a pause or cancel of a running task
+//     is reported when the worker reaches the new state; the last snapshot the listener gets
+//     is the final state; the listener may call snapshot() and may throw;
 //   * the destructor stops and joins every worker, whether idle or busy; it interrupts running
 //     downloads instead of waiting for them, and starts no queued task.
 namespace {
@@ -73,6 +80,55 @@ namespace {
     // is an interruption, not the delay running out.
     RetryPolicy endless_wait(std::uint32_t attempts = 5) {
         return {.max_attempts = attempts, .initial_delay = 10min, .max_delay = 10min};
+    }
+
+    // Collects every snapshot the manager reports. The manager may call it from several threads.
+    class ListenerRecorder {
+    public:
+        DownloadManager::StateListener listener() {
+            return [this](const std::vector<TaskInfo>& tasks) {
+                std::scoped_lock lock(mutex_);
+                calls_.push_back(tasks);
+            };
+        }
+
+        std::size_t count() const {
+            std::scoped_lock lock(mutex_);
+            return calls_.size();
+        }
+
+        std::vector<std::vector<TaskInfo>> calls() const {
+            std::scoped_lock lock(mutex_);
+            return calls_;
+        }
+
+        // The last snapshot reported so far; empty optional if there was none.
+        std::optional<std::vector<TaskInfo>> last() const {
+            std::scoped_lock lock(mutex_);
+            if (calls_.empty()) {
+                return std::nullopt;
+            }
+            return calls_.back();
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        std::vector<std::vector<TaskInfo>> calls_;
+    };
+
+    // The task with `id` in a snapshot, if it is there.
+    std::optional<TaskInfo> task_in(const std::vector<TaskInfo>& tasks, TaskId id) {
+        for (const TaskInfo& info : tasks) {
+            if (info.id == id) {
+                return info;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<TaskState> state_in(const std::vector<TaskInfo>& tasks, TaskId id) {
+        const auto info = task_in(tasks, id);
+        return info ? std::optional<TaskState>(info->state) : std::nullopt;
     }
 
     TransferResult network_error(const std::string& message = "fake: connection reset") {
@@ -121,8 +177,9 @@ namespace {
             SandboxTest::TearDown();
         }
 
-        DownloadManager& start(std::size_t threads, RetryPolicy policy = no_retries()) {
-            manager_.emplace(fake_.executor(), threads, policy);
+        DownloadManager& start(std::size_t threads, RetryPolicy policy = no_retries(),
+                               DownloadManager::StateListener listener = {}) {
+            manager_.emplace(fake_.executor(), threads, policy, std::move(listener));
             return *manager_;
         }
 
@@ -186,7 +243,33 @@ namespace {
             return false;
         }
 
+        // Polls until the last reported snapshot satisfies `condition`; false after the timeout.
+        bool wait_for_report(const std::function<bool(const std::vector<TaskInfo>&)>& condition) const {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                const auto last = recorder_.last();
+                if (last && condition(*last)) {
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return false;
+        }
+
+        bool wait_for_reported_state(TaskId id, TaskState expected) const {
+            return wait_for_report([id, expected](const std::vector<TaskInfo>& tasks) {
+                return state_in(tasks, id) == expected;
+            });
+        }
+
+        // A manager without workers: tasks stay where add/pause/resume/cancel put them, so the
+        // reports of these actions can be checked one by one.
+        DownloadManager& start_without_workers() {
+            return start(0, no_retries(), recorder_.listener());
+        }
+
         FakeExecutor fake_;
+        ListenerRecorder recorder_;   // declared before manager_: outlives the workers that call it
         std::optional<DownloadManager> manager_;
     };
 
@@ -870,6 +953,186 @@ namespace {
 
         EXPECT_TRUE(finishes_in_time([this] { manager_.reset(); }))
                 << "closing the program must not wait for the delay";
+    }
+
+    // --- state listener (step 4, saving the state) ------------------------------------------
+
+    TEST_F(DownloadManagerTest, AddIsReported) {
+        start_without_workers();
+        const TaskId id = add("a.bin");
+
+        ASSERT_EQ(recorder_.count(), 1u);
+        const auto last = recorder_.last();
+        EXPECT_EQ(state_in(*last, id), TaskState::Queued);
+        EXPECT_EQ(task_in(*last, id)->url, url("a.bin"));
+    }
+
+    TEST_F(DownloadManagerTest, EveryReportIsTheWholeList) {
+        start_without_workers();
+        add("a.bin");
+        add("b.bin");
+        add("c.bin");
+
+        ASSERT_EQ(recorder_.count(), 3u);
+        EXPECT_EQ(recorder_.last()->size(), 3u) << "the listener saves the whole list, not one task";
+    }
+
+    TEST_F(DownloadManagerTest, PauseResumeAndCancelOfWaitingTaskAreReported) {
+        start_without_workers();
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(manager_->pause(id));
+        EXPECT_EQ(recorder_.count(), 2u);
+        EXPECT_EQ(state_in(*recorder_.last(), id), TaskState::Paused);
+
+        ASSERT_TRUE(manager_->resume(id));
+        EXPECT_EQ(recorder_.count(), 3u);
+        EXPECT_EQ(state_in(*recorder_.last(), id), TaskState::Queued);
+
+        ASSERT_TRUE(manager_->cancel(id));
+        EXPECT_EQ(recorder_.count(), 4u);
+        EXPECT_EQ(state_in(*recorder_.last(), id), TaskState::Canceled);
+    }
+
+    TEST_F(DownloadManagerTest, CancelOfPausedTaskIsReported) {
+        start_without_workers();
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(manager_->pause(id));
+
+        ASSERT_TRUE(manager_->cancel(id));
+        EXPECT_EQ(state_in(*recorder_.last(), id), TaskState::Canceled);
+    }
+
+    TEST_F(DownloadManagerTest, RefusedActionsReportNothing) {
+        start_without_workers();
+        const TaskId id = add("a.bin");
+        const std::size_t before = recorder_.count();
+
+        EXPECT_FALSE(manager_->pause(id + 100));
+        EXPECT_FALSE(manager_->resume(id + 100));
+        EXPECT_FALSE(manager_->cancel(id + 100));
+        EXPECT_FALSE(manager_->resume(id)) << "a queued task cannot be resumed";
+
+        EXPECT_EQ(recorder_.count(), before) << "nothing changed, so there is nothing to save";
+    }
+
+    TEST_F(DownloadManagerTest, ReportsAndSnapshotAreSortedById) {
+        start_without_workers();
+        std::vector<TaskId> ids;
+        for (int i = 0; i < 20; ++i) {
+            ids.push_back(add("file" + std::to_string(i) + ".bin"));
+        }
+
+        // Kept in a variable: a range-for over *recorder_.last() would read a destroyed temporary.
+        const auto last = recorder_.last();
+        ASSERT_TRUE(last.has_value());
+        std::vector<TaskId> reported;
+        for (const TaskInfo& info : *last) {
+            reported.push_back(info.id);
+        }
+        EXPECT_EQ(reported, ids) << "list and state.json show the tasks in the order they were added";
+
+        std::vector<TaskId> listed;
+        for (const TaskInfo& info : manager_->snapshot()) {
+            listed.push_back(info.id);
+        }
+        EXPECT_EQ(listed, ids);
+    }
+
+    TEST_F(DownloadManagerTest, WorkerReportsDownloadingAndCompleted) {
+        fake_.block();
+        start(1, no_retries(), recorder_.listener());
+        const TaskId id = add("a.bin");
+
+        EXPECT_TRUE(wait_for_reported_state(id, TaskState::Downloading)) << "the worker took the task";
+        fake_.release();
+        EXPECT_TRUE(wait_for_reported_state(id, TaskState::Completed));
+    }
+
+    TEST_F(DownloadManagerTest, FailureIsReported) {
+        start(1, no_retries(), recorder_.listener());
+        const TaskId id = add("404");
+
+        ASSERT_TRUE(wait_for_reported_state(id, TaskState::Failed));
+        EXPECT_EQ(task_in(*recorder_.last(), id)->http_status_code, 404) << "the saved task says why it failed";
+    }
+
+    TEST_F(DownloadManagerTest, RetryingIsReportedBeforeTheWait) {
+        start(1, endless_wait(), recorder_.listener());
+        const TaskId id = add("fail");
+
+        EXPECT_TRUE(wait_for_reported_state(id, TaskState::Retrying))
+                << "the delay is 10 minutes: the report must not wait for it";
+    }
+
+    TEST_F(DownloadManagerTest, PauseOfRunningTaskIsReportedWhenTheWorkerStops) {
+        fake_.block();
+        start(1, no_retries(), recorder_.listener());
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+
+        ASSERT_TRUE(manager_->pause(id));
+        EXPECT_TRUE(wait_for_reported_state(id, TaskState::Paused));
+    }
+
+    TEST_F(DownloadManagerTest, CancelOfRunningTaskIsReportedWhenTheWorkerStops) {
+        fake_.block();
+        start(1, no_retries(), recorder_.listener());
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+
+        ASSERT_TRUE(manager_->cancel(id));
+        EXPECT_TRUE(wait_for_reported_state(id, TaskState::Canceled));
+    }
+
+    // Several workers report at the same time; an older snapshot must never be the last one,
+    // or the saved file would show a state the tasks have already left.
+    TEST_F(DownloadManagerTest, LastReportIsTheFinalStateWithSeveralWorkers) {
+        start(3, no_retries(), recorder_.listener());
+        std::vector<TaskId> ids;
+        for (int i = 0; i < 30; ++i) {
+            ids.push_back(add(i % 3 == 0 ? "fail" : i % 3 == 1 ? "404" : "file" + std::to_string(i) + ".bin"));
+        }
+        for (const TaskId id : ids) {
+            ASSERT_TRUE(wait_until(id, [](const TaskInfo& info) {
+                return info.state == TaskState::Completed || info.state == TaskState::Failed;
+            }));
+        }
+
+        const auto final_state = manager_->snapshot();
+        EXPECT_TRUE(wait_for_report([&final_state](const std::vector<TaskInfo>& reported) {
+            if (reported.size() != final_state.size()) {
+                return false;
+            }
+            for (std::size_t i = 0; i < reported.size(); ++i) {
+                if (reported[i].id != final_state[i].id || reported[i].state != final_state[i].state) {
+                    return false;
+                }
+            }
+            return true;
+        })) << "the last snapshot the listener got must match the final state";
+    }
+
+    // A listener that calls back into the manager must not dead-lock: it runs without the lock.
+    TEST_F(DownloadManagerTest, ListenerMayCallSnapshot) {
+        std::size_t seen = 0;
+        start(0, no_retries(), [this, &seen](const std::vector<TaskInfo>&) {
+            seen = manager_->snapshot().size();
+        });
+
+        EXPECT_TRUE(finishes_in_time([this] { (void)manager_->add(url("a.bin"), target("a.bin")); }))
+                << "the listener was called while the manager held its lock";
+        EXPECT_EQ(seen, 1u);
+    }
+
+    TEST_F(DownloadManagerTest, ThrowingListenerDoesNotBreakTheManager) {
+        start(1, no_retries(), [](const std::vector<TaskInfo>&) {
+            throw std::runtime_error("cannot write state.json");
+        });
+
+        const TaskId id = add("a.bin");
+        EXPECT_TRUE(wait_for_state(id, TaskState::Completed)) << "the worker survives the listener's exception";
+        EXPECT_TRUE(fs::exists(target("a.bin")));
     }
 
     // --- shutdown --------------------------------------------------------------------------

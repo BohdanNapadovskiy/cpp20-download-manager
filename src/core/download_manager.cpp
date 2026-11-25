@@ -1,10 +1,14 @@
 #include "core/download_manager.hpp"
+
+#include <algorithm>
 #include <optional>
 
 namespace dm::core {
     DownloadManager::DownloadManager(Executor executor, std::size_t thread_count,
-                                     RetryPolicy retry_policy) : executor_(std::move(executor)),
-                                                                 retry_policy_(retry_policy) {
+                                     RetryPolicy retry_policy,
+                                     StateListener state_listener) : executor_(std::move(executor)),
+                                                                     retry_policy_(retry_policy),
+                                                                     state_listener_(std::move(state_listener)) {
         workers_.reserve(thread_count);
         for (std::size_t i = 0; i < thread_count; ++i) {
             workers_.emplace_back([this](std::stop_token stop_token) {
@@ -21,6 +25,7 @@ namespace dm::core {
 
     TaskId DownloadManager::add(std::string url, std::filesystem::path target_path) {
         TaskId id{};
+         StateChange state_change;
         {
             std::lock_guard lock(mutex_);
             id = next_id_++;
@@ -31,76 +36,90 @@ namespace dm::core {
                                .target_path = std::move(target_path),
                            });
             queue_.emplace_back(id);
+            state_change = record_change_locked();
         }
         cv_.notify_one();
+        notify(state_change);
         return id;
     }
 
     bool DownloadManager::pause(TaskId id) {
-        std::lock_guard lock(mutex_);
-        auto it = tasks_.find(id);
-        if (it == tasks_.end()) {
-            return false;
-        }
-        if (it->second.info.state == TaskState::Queued) {
-            it->second.info.state = TaskState::Paused;
-            std::erase(queue_, id);
-            return true;
-        } else if (it->second.info.state == TaskState::Downloading || it->second.info.state == TaskState::Retrying) {
-            it->second.stop_reason = StopReason::Paused;
-            it->second.stop.request_stop();
-            return true;
-        }
-        return false;
-    }
-
-    bool DownloadManager::resume(TaskId id) {
+        bool result = false;
+        StateChange state_change;
         {
             std::lock_guard lock(mutex_);
             auto it = tasks_.find(id);
-            if (it == tasks_.end()) {
-                return false;
+            if (it != tasks_.end()) {
+                if (it->second.info.state == TaskState::Queued) {
+                    it->second.info.state = TaskState::Paused;
+                    std::erase(queue_, id);
+                    state_change = record_change_locked();
+                    result = true;
+                } else if (it->second.info.state == TaskState::Downloading || it->second.info.state ==
+                           TaskState::Retrying) {
+                    it->second.stop_reason = StopReason::Paused;
+                    it->second.stop.request_stop();
+                    result = true;
+                }
             }
-            const bool resumable = it->second.info.state == TaskState::Paused
-                                   || it->second.info.state == TaskState::Failed;
-            if (!resumable) {
-                return false;
+        }
+        notify(state_change);
+        return result;
+    }
+
+    bool DownloadManager::resume(TaskId id) {
+        StateChange state_change;
+        bool result = false;
+        {
+            std::lock_guard lock(mutex_);
+            auto it = tasks_.find(id);
+            if (it != tasks_.end()) {
+                const bool resumable = it->second.info.state == TaskState::Paused
+                                       || it->second.info.state == TaskState::Failed;
+                if (!resumable) {
+                    return false;
+                }
+                it->second.stop = std::stop_source{};
+                it->second.info.attempt = 0;
+                it->second.info.error_message.clear();
+                it->second.info.http_status_code = 0;
+                it->second.stop_reason = StopReason::None;
+                it->second.info.state = TaskState::Queued;
+                queue_.emplace_back(id);
+                state_change = record_change_locked();
+                result = true;
             }
-            it->second.stop = std::stop_source{};
-            it->second.info.attempt = 0;
-            it->second.info.error_message.clear();
-            it->second.info.http_status_code = 0;
-            it->second.stop_reason = StopReason::None;
-            it->second.info.state = TaskState::Queued;
-            queue_.emplace_back(id);
         }
         cv_.notify_one();
-        return true;
+        notify(state_change);
+        return result;
     }
 
     bool DownloadManager::cancel(TaskId id) {
         std::filesystem::path target_path;
         bool result = false;
+        StateChange state_change;
         {
             std::lock_guard lock(mutex_);
             auto it = tasks_.find(id);
-            if (it == tasks_.end()) {
-                return result;
-            }
-            if (it->second.info.state == TaskState::Queued) {
-                it->second.info.state = TaskState::Canceled;
-                std::erase(queue_, id);
-                target_path = it->second.info.target_path;
-                result = true;
-            } else if (it->second.info.state == TaskState::Paused) {
-                it->second.info.state = TaskState::Canceled;
-                target_path = it->second.info.target_path;
-                result = true;
-            } else if (it->second.info.state == TaskState::Downloading || it->second.info.state ==
-                       TaskState::Retrying) {
-                it->second.stop_reason = StopReason::Canceled;
-                it->second.stop.request_stop();
-                result = true;
+            if (it != tasks_.end()) {
+                if (it->second.info.state == TaskState::Queued) {
+                    it->second.info.state = TaskState::Canceled;
+                    std::erase(queue_, id);
+                    target_path = it->second.info.target_path;
+                    state_change = record_change_locked();
+                    result = true;
+                } else if (it->second.info.state == TaskState::Paused) {
+                    it->second.info.state = TaskState::Canceled;
+                    target_path = it->second.info.target_path;
+                    state_change = record_change_locked();
+                    result = true;
+                } else if (it->second.info.state == TaskState::Downloading || it->second.info.state ==
+                           TaskState::Retrying) {
+                    it->second.stop_reason = StopReason::Canceled;
+                    it->second.stop.request_stop();
+                    result = true;
+                }
             }
         }
         if (!target_path.empty()) {
@@ -109,17 +128,13 @@ namespace dm::core {
             part_path += ".part";
             std::filesystem::remove(part_path, ec);
         }
+        notify(state_change);
         return result;
     }
 
     std::vector<TaskInfo> DownloadManager::snapshot() const {
         std::lock_guard lock(mutex_);
-        std::vector<TaskInfo> result;
-        result.reserve(tasks_.size());
-        for (const auto &[id, task]: tasks_) {
-            result.push_back(task.info);
-        }
-        return result;
+        return snapshot_locked();
     }
 
     std::optional<DownloadManager::Job> DownloadManager::take_next(std::stop_token stop_token) {
@@ -192,16 +207,21 @@ namespace dm::core {
     }
 
     void DownloadManager::begin_attempt(TaskId task_id, std::uint32_t attempt) {
-        std::lock_guard lock(mutex_);
-        auto task_it = tasks_.find(task_id);
-        if (task_it != tasks_.end()) {
-            task_it->second.info.attempt = attempt;
-            task_it->second.info.state = TaskState::Downloading;
-            task_it->second.info.downloaded_bytes = 0;
-            task_it->second.info.total_bytes = 0;
-            task_it->second.info.speed_bps = 0;
-            task_it->second.speed_meter = SpeedMeter{};
+        StateChange state_change;
+        {
+            std::lock_guard lock(mutex_);
+            auto task_it = tasks_.find(task_id);
+            if (task_it != tasks_.end()) {
+                task_it->second.info.attempt = attempt;
+                task_it->second.info.state = TaskState::Downloading;
+                task_it->second.info.downloaded_bytes = 0;
+                task_it->second.info.total_bytes = 0;
+                task_it->second.info.speed_bps = 0;
+                task_it->second.speed_meter = SpeedMeter{};
+                state_change = record_change_locked();
+            }
         }
+        notify(state_change);
     }
 
     bool DownloadManager::wait_before_retry(TaskId task_id, const TransferResult &result, std::uint32_t next_attempt,
@@ -215,6 +235,10 @@ namespace dm::core {
         task_it->second.info.error_message = result.error_message;
         task_it->second.info.http_status_code = result.http_status_code;
         task_it->second.info.speed_bps = 0;
+        const StateChange state_change = record_change_locked();
+        lock.unlock();
+        notify(state_change);
+        lock.lock();
         auto delay = retry_delay(retry_policy_, next_attempt);
         std::condition_variable_any retry_wait;
         retry_wait.wait_for(lock, stop_token, delay, []() {
@@ -232,6 +256,7 @@ namespace dm::core {
             }
         }
         bool need_remove = false;
+        StateChange state_change;
         {
             std::lock_guard lock(mutex_);
             auto task_it = tasks_.find(job.id);
@@ -253,18 +278,53 @@ namespace dm::core {
                     task_it->second.info.state = TaskState::Failed;
                 }
                 task_it->second.info.speed_bps = 0;
+                state_change = record_change_locked();
             }
         }
+        notify(state_change);
         if (need_remove) {
             std::error_code error_code;
             std::filesystem::remove(job.part_path, error_code);
         }
     }
 
+    DownloadManager::StateChange DownloadManager::record_change_locked() {
+        return {.number = ++change_seq_, .tasks = snapshot_locked()};
+    }
+
     void DownloadManager::worker_loop(std::stop_token stop_token) {
         while (auto task = take_next(stop_token)) {
             auto result = download_with_retries(*task, stop_token);
             finish(*task, result);
+        }
+    }
+
+
+
+    std::vector<TaskInfo> DownloadManager::snapshot_locked() const {
+        std::vector<TaskInfo> result;
+        result.reserve(tasks_.size());
+        for (const auto &[id, task]: tasks_) {
+            result.push_back(task.info);
+        }
+        std::ranges::sort(result, {}, &TaskInfo::id);
+        return result;
+    }
+
+    void DownloadManager::notify(const StateChange& change) {
+        if (!state_listener_) {
+            return;
+        }
+        std::lock_guard lock(notify_mutex_);
+        if (change.number <= last_notified_seq_) {
+            return;
+        }
+        last_notified_seq_ = change.number;
+        try {
+            state_listener_(change.tasks);
+        } catch (...) {
+            // Ігноруємо виняток слухача: збій у ньому (наприклад, невдалий запис файлу стану)
+            // не повинен зупиняти менеджер чи працівника, з потоку якого його викликано
         }
     }
 }

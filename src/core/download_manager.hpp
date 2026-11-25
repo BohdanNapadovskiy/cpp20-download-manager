@@ -20,9 +20,11 @@ namespace dm::core {
     class DownloadManager {
     public:
         using Executor = std::function<decltype(download_once)>;
+        using StateListener = std::function<void(const std::vector<TaskInfo> &)>;
 
         explicit DownloadManager(Executor executor,
-                                 std::size_t thread_count, RetryPolicy retry_policy = RetryPolicy{});
+                                 std::size_t thread_count, RetryPolicy retry_policy = RetryPolicy{},
+                                 StateListener state_listener = StateListener{});
 
         ~DownloadManager();
 
@@ -52,6 +54,11 @@ namespace dm::core {
             None
         };
 
+        struct StateChange {
+            std::uint64_t number = 0;
+            std::vector<TaskInfo> tasks{};
+        };
+
         struct Task {
             TaskInfo info;
             std::stop_source stop;
@@ -76,20 +83,31 @@ namespace dm::core {
         void begin_attempt(TaskId task_id, std::uint32_t attempt);
 
         [[nodiscard]] bool wait_before_retry(TaskId task_id, const TransferResult &result, std::uint32_t next_attempt,
-                               std::stop_token stop_token);
+                                             std::stop_token stop_token);
 
         void finish(const Job &job, TransferResult &transfer_result);
+
+        StateChange record_change_locked();
+
+        std::vector<TaskInfo> snapshot_locked() const;
+
+        void notify(const StateChange& change);
 
         Executor executor_;
         // mutable дозволяє блокувати м'ютекс усередині const-методу snapshot()
         mutable std::mutex mutex_;
+        std::mutex notify_mutex_;
         std::condition_variable_any cv_;
         TaskId next_id_{1};
         std::unordered_map<TaskId, Task> tasks_;
         std::deque<TaskId> queue_;
         RetryPolicy retry_policy_;
+        StateListener state_listener_;
         // Потоки ОБОВ'ЯЗКОВО останніми: вони знищаться першими,
-        // гарантуючи, що mutex_, cv_, tasks_ та queue_ живі до завершення всіх worker_loop.
+        // гарантуючи, що mutex_, cv_, tasks_, state_listener_ та queue_ живі до завершення всіх worker_loop.
+        std::uint64_t change_seq_ = 0;
+        std::uint64_t last_notified_seq_ = 0;
         std::vector<std::jthread> workers_;
+
     };
 }
