@@ -36,6 +36,7 @@ add_executable(dm_tests
         download_once_validators_test.cpp
         speed_meter_test.cpp
         retry_test.cpp
+        resume_test.cpp
         state_store_test.cpp
         download_manager_test.cpp
 )
