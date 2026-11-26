@@ -33,6 +33,8 @@ namespace dm::core {
             std::uintmax_t bytes_transferred = 0;
             int http_status = 0;
             WriteFailure failure = WriteFailure::None;
+            std::string last_modified {};
+            std::string etag {};
         };
 
         // path::string() converts to the ANSI code page on Windows and mangles non-ASCII names.
@@ -54,15 +56,34 @@ namespace dm::core {
             return {};
         }
 
+
+        bool iequals(std::string_view a, std::string_view b) noexcept {
+            return std::ranges::equal(a, b, [](char c1, char c2) {
+                return std::tolower(static_cast<unsigned char>(c1)) ==
+                       std::tolower(static_cast<unsigned char>(c2));
+            });
+        }
+
+        std::string_view trim_ows(std::string_view sv) noexcept {
+            constexpr std::string_view whitespace = " \t\r\n";
+            const auto first = sv.find_first_not_of(whitespace);
+            if (first == std::string_view::npos) {
+                return {};
+            }
+            const auto last = sv.find_last_not_of(whitespace);
+            return sv.substr(first, last - first + 1);
+        }
+
         std::size_t header_callback(char *ptr, std::size_t size, std::size_t count, void *data) {
             const std::size_t total_size = size * count;
-            auto *s = static_cast<FileWriteState *>(data);
-
-            if (!s) {
+            auto *state = static_cast<FileWriteState *>(data);
+            if (!state) {
                 return 0;
             }
             std::string_view header_line(ptr, total_size);
             if (header_line.starts_with("HTTP/")) {
+                state->etag.clear();
+                state->last_modified.clear();
                 std::size_t first_space = header_line.find(' ');
                 if (first_space != std::string_view::npos) {
                     std::size_t status_pos = first_space + 1;
@@ -74,8 +95,19 @@ namespace dm::core {
                         auto res = std::from_chars(status_str.data(), status_str.data() + status_str.size(),
                                                    parsed_code);
                         if (res.ec == std::errc{}) {
-                            s->http_status = parsed_code;
+                            state->http_status = parsed_code;
                         }
+                    }
+                }
+            } else {
+                const auto colon_pos = header_line.find(':');
+                if (colon_pos != std::string_view::npos) {
+                    const std::string_view name = trim_ows(header_line.substr(0, colon_pos));
+                    const std::string_view value = trim_ows(header_line.substr(colon_pos + 1));
+                    if (iequals(name, "ETag")) {
+                        state->etag = std::string(value);
+                    } else if (iequals(name, "Last-Modified")) {
+                        state->last_modified = std::string(value);
                     }
                 }
             }
@@ -234,9 +266,10 @@ namespace dm::core {
         } else if (code == CURLE_ABORTED_BY_CALLBACK) {
             error = TransferError::Aborted;
             error_msg = "download_once() aborted: stop requested";
-        } else if (code == CURLE_RANGE_ERROR || (code == CURLE_OK && http_status == 416 && state.resume_from > 0) ) {
+        } else if (code == CURLE_RANGE_ERROR || (code == CURLE_OK && http_status == 416 && state.resume_from > 0)) {
             error = TransferError::ResumeRejected;
-            error_msg = "download_once() failed: server refused to resume from byte: " + std::to_string(state.resume_from);
+            error_msg = "download_once() failed: server refused to resume from byte: " + std::to_string(
+                            state.resume_from);
             std::error_code remove_ec;
             std::filesystem::remove(state.part_path, remove_ec);
         } else if (code != CURLE_OK) {
@@ -250,7 +283,9 @@ namespace dm::core {
             .error = error,
             .http_status_code = http_status,
             .error_message = error_msg,
-            .bytes_transferred = state.bytes_transferred
+            .bytes_transferred = state.bytes_transferred,
+            .etag = state.etag,
+            .last_modified = state.last_modified,
         };
     }
 }
