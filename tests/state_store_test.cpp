@@ -23,6 +23,7 @@ using dm::core::TaskState;
 // "Стан між запусками"):
 //   * saved tasks come back with id, URL, target path, state, total size, error message and
 //     HTTP status; what is not stored (downloaded bytes, speed, attempt) comes back as 0;
+//   * the If-Range validator is saved; a file written before it existed loads with an empty one;
 //   * canceled tasks are not saved; Downloading and Retrying come back as Queued;
 //   * non-ASCII (Cyrillic) paths survive, both in the tasks and in the path of the file itself;
 //   * a missing file is a first start: success, no tasks, no message;
@@ -111,6 +112,34 @@ namespace {
         EXPECT_EQ(loaded.tasks[0].downloaded_bytes, 0u) << "the size of the .part decides, not the file";
         EXPECT_EQ(loaded.tasks[0].speed_bps, 0u);
         EXPECT_EQ(loaded.tasks[0].attempt, 0u) << "after a restart the attempts start again";
+    }
+
+    TEST_F(StateStoreTest, ValidatorIsSavedAndLoaded) {
+        TaskInfo paused = task(1, TaskState::Paused, "a.bin");
+        paused.validator = "\"v1-abc\"";
+        TaskInfo dated = task(2, TaskState::Paused, "b.bin");
+        dated.validator = "Wed, 21 Oct 2025 07:28:00 GMT";
+
+        const LoadResult loaded = round_trip({paused, dated});
+
+        ASSERT_EQ(loaded.tasks.size(), 2u);
+        EXPECT_EQ(loaded.tasks[0].validator, "\"v1-abc\"") << "quotes included";
+        EXPECT_EQ(loaded.tasks[1].validator, "Wed, 21 Oct 2025 07:28:00 GMT");
+    }
+
+    // A state.json written before the validator existed has no such key. Losing every task
+    // after an update of the program would be far worse than not checking If-Range once.
+    TEST_F(StateStoreTest, FileWithoutValidatorStillLoads) {
+        write_file(state_file(), R"({"version": 1, "tasks": [{"id": 3, "url": "https://example.com/a.bin",
+            "target_path": "a.bin", "state": "Paused", "total_bytes": 100, "error_message": "",
+            "http_status_code": 0}]})");
+
+        const LoadResult loaded = load_state(state_file());
+
+        EXPECT_TRUE(loaded.success) << loaded.error_message;
+        ASSERT_EQ(loaded.tasks.size(), 1u);
+        EXPECT_EQ(loaded.tasks[0].id, 3u);
+        EXPECT_TRUE(loaded.tasks[0].validator.empty());
     }
 
     TEST_F(StateStoreTest, EmptyListIsSavedAndLoaded) {

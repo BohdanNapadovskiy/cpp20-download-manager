@@ -17,6 +17,7 @@ namespace dm::core {
         constexpr std::string_view key_http_status_code = "http_status_code";
         constexpr std::string_view key_tasks = "tasks";
         constexpr std::string_view key_version = "version";
+        constexpr std::string_view key_validator = "validator";
 
         std::string_view state_to_string(TaskState state) noexcept {
             switch (state) {
@@ -92,6 +93,7 @@ namespace dm::core {
                     {key_total_bytes, task.total_bytes},
                     {key_error_message, task.error_message},
                     {key_http_status_code, task.http_status_code},
+                    {key_validator, task.validator},
                 };
                 arr.push_back(std::move(item));
             }
@@ -116,7 +118,9 @@ namespace dm::core {
                 out.close();
                 if (!out) {
                     return {
-                        .success = false, .error_message = "save_state() failed: error while writing to temporary file: " + path_to_string(tmp_path)
+                        .success = false,
+                        .error_message = "save_state() failed: error while writing to temporary file: " +
+                                         path_to_string(tmp_path)
                     };
                 }
             }
@@ -168,6 +172,7 @@ namespace dm::core {
                 task.total_bytes = item.at(key_total_bytes).get<std::uint64_t>();
                 task.error_message = item.at(key_error_message).get<std::string>();
                 task.http_status_code = item.at(key_http_status_code).get<int>();
+                task.validator =  item.value(key_validator, std::string{});
                 const auto state_str = item.at(key_state).get<std::string>();
                 const auto parsed_state = string_to_state(state_str);
                 if (!parsed_state.has_value()) {

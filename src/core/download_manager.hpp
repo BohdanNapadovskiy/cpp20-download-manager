@@ -74,11 +74,14 @@ namespace dm::core {
             std::filesystem::path target_path;
             std::filesystem::path part_path;
             std::stop_source task_stop;
+            std::string validator;
         };
 
         void worker_loop(std::stop_token stop_token);
 
         std::optional<Job> take_next(std::stop_token stop_token);
+
+        void remember_validator(TaskId id, const std::string &mark);
 
         TransferResult download_with_retries(Job &job, std::stop_token stop_token);
 

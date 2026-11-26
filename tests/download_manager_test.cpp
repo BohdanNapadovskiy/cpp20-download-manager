@@ -64,6 +64,10 @@ using dm::test::FakeExecutor;
 //     .part (a completed task shows its full size); speed and attempt start from 0; the next
 //     add() gets an id after the largest restored one; a task whose id exists is not restored
 //     again; restore() returns how many tasks it added;
+//   * the If-Range validator of a task follows the last response whose body went into the .part
+//     (200 or 206, even if the attempt then failed or was paused): the next attempt, a resume and
+//     a restored task send it; a response without one clears it; a failure without a response
+//     keeps it; a weak ETag gives way to Last-Modified; it is part of the reported snapshot;
 //   * the destructor stops and joins every worker, whether idle or busy; it interrupts running
 //     downloads instead of waiting for them, and starts no queued task.
 namespace {
@@ -1299,6 +1303,119 @@ namespace {
         ASSERT_TRUE(wait_for_state(1, TaskState::Completed));
         std::this_thread::sleep_for(std::chrono::milliseconds(50));   // a second queue entry would start now
         EXPECT_EQ(fake_.calls_for(url("a.bin")), 1u) << "a skipped task must not be put in the queue again";
+    }
+
+    // --- If-Range validator (step 4) --------------------------------------------------------
+
+    TEST_F(DownloadManagerTest, FirstAttemptOfANewTaskSendsNoValidator) {
+        start(1);
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        EXPECT_EQ(fake_.requests()[0].if_range, "") << "nothing is known about the file yet";
+    }
+
+    // The first attempt got the headers (200 with an ETag) and part of the body, then the
+    // connection dropped: the retry continues that .part, so it must send that ETag.
+    TEST_F(DownloadManagerTest, RetryAfterABrokenDownloadSendsItsValidator) {
+        fake_.fail_next(url("a.bin"), {.error = TransferError::Network, .http_status_code = 200,
+                                       .error_message = "fake: connection reset", .etag = "\"v1\""});
+        start(1, quick_retries(3));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        const auto requests = fake_.requests();
+        ASSERT_EQ(requests.size(), 2u);
+        EXPECT_EQ(requests[1].if_range, "\"v1\"");
+    }
+
+    TEST_F(DownloadManagerTest, PausedTaskKeepsItsValidatorAndResumeSendsIt) {
+        fake_.set_etag(url("a.bin"), "\"v1\"");
+        fake_.block();
+        start(1);
+        const TaskId id = add("a.bin");
+        ASSERT_TRUE(fake_.wait_started(1));
+        ASSERT_TRUE(manager_->pause(id));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Paused));
+        EXPECT_EQ(find(id)->validator, "\"v1\"") << "the .part holds bytes of the version \"v1\"";
+
+        fake_.release();
+        ASSERT_TRUE(manager_->resume(id));
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        const auto requests = fake_.requests();
+        ASSERT_EQ(requests.size(), 2u);
+        EXPECT_EQ(requests[1].if_range, "\"v1\"") << "a resumed task checks that the file did not change";
+    }
+
+    TEST_F(DownloadManagerTest, ResponseWithoutValidatorClearsIt) {
+        fake_.fail_next(url("a.bin"), {.error = TransferError::Network, .http_status_code = 200,
+                                       .error_message = "fake: connection reset", .etag = "\"v1\""});
+        fake_.fail_next(url("a.bin"), {.error = TransferError::Network, .http_status_code = 200,
+                                       .error_message = "fake: connection reset"});
+        start(1, quick_retries(3));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        const auto requests = fake_.requests();
+        ASSERT_EQ(requests.size(), 3u);
+        EXPECT_EQ(requests[2].if_range, "") << "the .part now holds a version without a validator";
+    }
+
+    TEST_F(DownloadManagerTest, FailureWithoutAResponseKeepsTheValidator) {
+        fake_.fail_next(url("a.bin"), {.error = TransferError::Network, .http_status_code = 200,
+                                       .error_message = "fake: connection reset", .etag = "\"v1\""});
+        fake_.fail_next(url("a.bin"), network_error());   // no response at all: status 0
+        start(1, quick_retries(3));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        const auto requests = fake_.requests();
+        ASSERT_EQ(requests.size(), 3u);
+        EXPECT_EQ(requests[2].if_range, "\"v1\"") << "the .part did not change, nor did its version";
+    }
+
+    TEST_F(DownloadManagerTest, ErrorStatusKeepsTheValidator) {
+        fake_.fail_next(url("a.bin"), {.error = TransferError::Network, .http_status_code = 200,
+                                       .error_message = "fake: connection reset", .etag = "\"v1\""});
+        fake_.fail_next(url("a.bin"), http_error(503));
+        start(1, quick_retries(3));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        ASSERT_EQ(fake_.requests().size(), 3u);
+        EXPECT_EQ(fake_.requests()[2].if_range, "\"v1\"") << "a 503 has no body that went into the .part";
+    }
+
+    TEST_F(DownloadManagerTest, WeakEtagGivesWayToLastModified) {
+        fake_.fail_next(url("a.bin"), {.error = TransferError::Network, .http_status_code = 200,
+                                       .error_message = "fake: connection reset", .etag = "W/\"v1\"",
+                                       .last_modified = "Wed, 21 Oct 2025 07:28:00 GMT"});
+        start(1, quick_retries(3));
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_state(id, TaskState::Completed));
+        ASSERT_EQ(fake_.requests().size(), 2u);
+        EXPECT_EQ(fake_.requests()[1].if_range, "Wed, 21 Oct 2025 07:28:00 GMT");
+    }
+
+    TEST_F(DownloadManagerTest, ValidatorIsPartOfTheReportedSnapshot) {
+        fake_.set_etag(url("a.bin"), "\"v1\"");
+        start(1, no_retries(), recorder_.listener());
+        const TaskId id = add("a.bin");
+
+        ASSERT_TRUE(wait_for_reported_state(id, TaskState::Completed));
+        EXPECT_EQ(task_in(*recorder_.last(), id)->validator, "\"v1\"") << "so that state.json keeps it";
+    }
+
+    TEST_F(DownloadManagerTest, RestoredValidatorIsSentOnTheFirstAttempt) {
+        start(1);
+        TaskInfo paused = saved(1, TaskState::Paused, "a.bin");
+        paused.validator = "\"v1\"";
+        ASSERT_EQ(manager_->restore({paused}), 1u);
+
+        ASSERT_TRUE(manager_->resume(1));
+        ASSERT_TRUE(wait_for_state(1, TaskState::Completed));
+        EXPECT_EQ(fake_.requests()[0].if_range, "\"v1\"") << "the check survives a restart";
     }
 
     // --- shutdown --------------------------------------------------------------------------

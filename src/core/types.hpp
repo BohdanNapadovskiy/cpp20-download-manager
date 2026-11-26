@@ -37,5 +37,6 @@ namespace dm::core {
         std::uint64_t total_bytes = 0;
         std::uint64_t speed_bps = 0;
         std::uint32_t attempt = 0;
+        std::string validator{};
     };
 }

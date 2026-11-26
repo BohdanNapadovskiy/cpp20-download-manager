@@ -28,7 +28,10 @@ namespace dm::test {
     //   * the outcome depends on the URL: ".../fail" -> Network error, ".../404" -> HttpStatus,
     //     anything else -> 200 and the file content "content of <url>" written to part_path;
     //   * fail_next(url, result) makes the next call for that URL return `result` instead, once;
-    //     several fail_next calls are used up in order, then the URL behaves as usual again.
+    //     several fail_next calls are used up in order, then the URL behaves as usual again;
+    //   * set_etag(url, etag) makes the server of that URL send an ETag: a successful call and a
+    //     held call that is stopped (it has received the response headers) both report it, with
+    //     status 200, like download_once does.
     // Records peak concurrency, every request, the order in which calls started and the number
     // of calls that ended as Aborted.
     class FakeExecutor {
@@ -57,6 +60,11 @@ namespace dm::test {
         void fail_next(const std::string& url, core::TransferResult result) {
             std::scoped_lock lock(mutex_);
             scripted_[url].push_back(std::move(result));
+        }
+
+        void set_etag(const std::string& url, std::string etag) {
+            std::scoped_lock lock(mutex_);
+            etags_[url] = std::move(etag);
         }
 
         // Sends one more progress report (downloaded, full size) from every call held in block(),
@@ -156,8 +164,13 @@ namespace dm::test {
                 if (!released) {
                     --active_;
                     ++aborted_;
-                    return {.error = core::TransferError::Aborted,
-                            .error_message = "fake: stop requested"};
+                    core::TransferResult aborted{.error = core::TransferError::Aborted,
+                                                 .error_message = "fake: stop requested"};
+                    if (const auto etag = etags_.find(request.url); etag != etags_.end()) {
+                        aborted.http_status_code = 200;   // the headers had arrived before the stop
+                        aborted.etag = etag->second;
+                    }
+                    return aborted;
                 }
             }
 
@@ -168,9 +181,14 @@ namespace dm::test {
                 --active_;
                 return result;
             }
+            const auto etag = etags_.find(request.url);
+            const std::string etag_value = etag != etags_.end() ? etag->second : std::string{};
             lock.unlock();
 
             core::TransferResult result = outcome(request);
+            if (result.ok()) {
+                result.etag = etag_value;
+            }
 
             lock.lock();
             --active_;
@@ -211,5 +229,6 @@ namespace dm::test {
         std::size_t aborted_ = 0;
         std::vector<core::TransferRequest> requests_;
         std::map<std::string, std::deque<core::TransferResult>> scripted_;   // fail_next()
+        std::map<std::string, std::string> etags_;                           // set_etag()
     };
 }

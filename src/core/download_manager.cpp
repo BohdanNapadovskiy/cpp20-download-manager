@@ -1,4 +1,5 @@
 #include "core/download_manager.hpp"
+#include "core/resume.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -160,8 +161,17 @@ namespace dm::core {
                 .url = it->second.info.url,
                 .target_path = it->second.info.target_path,
                 .part_path = part_path,
-                .task_stop = it->second.stop
+                .task_stop = it->second.stop,
+                .validator = it->second.info.validator,
             };
+        }
+    }
+
+    void DownloadManager::remember_validator(TaskId id, const std::string &mark) {
+        std::lock_guard on_progress(mutex_);
+        auto task_it = tasks_.find(id);
+        if (task_it != tasks_.end()) {
+            task_it->second.info.validator = mark;
         }
     }
 
@@ -180,7 +190,8 @@ namespace dm::core {
                     task_it->second.info.speed_bps = task_it->second.speed_meter.update(
                         downloaded, SpeedMeter::Clock::now());
                 }
-            }
+            },
+            .if_range = job.validator
         };
         TransferResult result;
         {
@@ -191,6 +202,11 @@ namespace dm::core {
             while (true) {
                 begin_attempt(job.id, attempt);
                 result = executor_(request);
+                if (is_success_status(result.http_status_code)) {
+                    std::string mark = if_range_validator(result.etag, result.last_modified);
+                    request.if_range = mark;
+                    remember_validator(job.id, mark);
+                }
                 if (!should_retry(result) || result.ok() || attempt >= retry_policy_.max_attempts) {
                     break;
                 }
