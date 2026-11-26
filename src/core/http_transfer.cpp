@@ -24,6 +24,8 @@ namespace dm::core {
             curl_easy_cleanup(h);
         })>;
 
+        using HeaderList = std::unique_ptr<curl_slist, decltype([](curl_slist *list) { curl_slist_free_all(list); })>;
+
         enum class WriteFailure { None, Open, Write, Close, Exception };
 
         struct FileWriteState {
@@ -33,8 +35,8 @@ namespace dm::core {
             std::uintmax_t bytes_transferred = 0;
             int http_status = 0;
             WriteFailure failure = WriteFailure::None;
-            std::string last_modified {};
-            std::string etag {};
+            std::string last_modified{};
+            std::string etag{};
         };
 
         // path::string() converts to the ANSI code page on Windows and mangles non-ASCII names.
@@ -243,6 +245,14 @@ namespace dm::core {
         curl_easy_setopt(handle.get(), CURLOPT_LOW_SPEED_TIME, low_speed_time);
         auto resume_offset = static_cast<curl_off_t>(state.resume_from);
         curl_easy_setopt(handle.get(), CURLOPT_RESUME_FROM_LARGE, resume_offset);
+        HeaderList headers;
+        if (!request.if_range.empty() && state.resume_from > 0) {
+            std::string header = "If-Range: " + request.if_range;
+            headers.reset(curl_slist_append(nullptr, header.c_str()));
+            if (headers) {
+                curl_easy_setopt(handle.get(), CURLOPT_HTTPHEADER, headers.get());
+            }
+        }
         const CURLcode code = curl_easy_perform(handle.get());
         auto info_code = curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response_code);
         if (info_code != CURLE_OK) {
